@@ -33,6 +33,8 @@ MASTER_LOG_DIR = os.environ.get("MASTER_LOG_DIR", "logs/")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output/")
 SHARE_DIR = os.environ.get("SHARE_DIR", ".")
 
+RESULT_DIR = os.path.join(SHARE_DIR, OUTPUT_DIR)
+
 logging.basicConfig(level = logging.INFO, format = "%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("master")
 
@@ -368,8 +370,8 @@ def run_job(job):
         job.log("MERGE  menggabungkan segmen tanpa re-encode")
 
         try:
-            files = [os.path.join(OUTPUT_DIR, job.job_id, job.results[key]["output_file"]) for key in sorted(job.results)]
-            output_path = CombineSegments().combine(files, job.video_path, job.job_id)
+            files = [os.path.join(RESULT_DIR, job.job_id, job.results[key]["output_file"]) for key in sorted(job.results)]
+            output_path = CombineSegments(output_dir = RESULT_DIR).combine(files, job.video_path, job.job_id)
             merge_error = None
             final_status = "completed"
         except Exception as e:
