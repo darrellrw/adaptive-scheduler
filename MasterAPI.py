@@ -493,10 +493,12 @@ def benchmark_worker_batch(worker_id: str, request: list[BenchmarkRequest]):
     if get_active_job():
         raise HTTPException(status_code = 409, detail = "A job is running, benchmark would disturb the measurement.")
 
+    results = []
+
     try:
         for req in request:
             registry.get_worker(worker_id)
-            registry.benchmark_worker(
+            results.append(registry.benchmark_worker(
                 worker_id,
                 req.video_path,
                 codec = req.codec,
@@ -504,7 +506,9 @@ def benchmark_worker_batch(worker_id: str, request: list[BenchmarkRequest]):
                 crf = req.crf,
                 repeat = req.repeat,
                 delay = req.delay,
-            )
+            ))
+        
+        return results
     except ValueError as e:
         raise HTTPException(status_code = 400, detail = str(e))
     except requests.HTTPError as e:
