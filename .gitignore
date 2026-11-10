@@ -1,0 +1,8 @@
+# Folder
+.venv
+.vscode
+__pycache__
+Scheduler/__pycache__
+
+# File
+.env
