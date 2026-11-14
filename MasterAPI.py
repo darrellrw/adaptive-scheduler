@@ -376,8 +376,9 @@ def run_job(job):
         job.log("MERGE  menggabungkan segmen tanpa re-encode")
 
         try:
-            files = [os.path.join(RESULT_DIR, job.job_id, job.results[key]["output_file"]) for key in sorted(job.results)]
-            output_path = CombineSegments(output_dir = RESULT_DIR).combine(files, job.video_path, job.job_id)
+            job_dir = os.path.join(RESULT_DIR, job.job_id)
+            files = [os.path.join(job_dir, job.results[key]["output_file"]) for key in sorted(job.results)]
+            output_path = CombineSegments(output_dir = job_dir).combine(files, job.video_path, job.job_id)
             merge_error = None
             final_status = "completed"
         except Exception as e:
