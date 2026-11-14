@@ -5,17 +5,19 @@ import time
 import uuid
 import logging
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 import requests
 import uvicorn
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from Scheduler import (
     VideoInformation,
     WorkerRegistry,
+    WorkerConflictError,
     AdaptiveDistributor,
     FIFODistributor,
     SJFDistributor,
@@ -24,11 +26,13 @@ from Scheduler import (
 )
 
 from Scheduler.Information import resolve_share_path
+from Scheduler.Worker import normalize_file_path
 
 MASTER_HOST = os.environ.get("MASTER_HOST", "0.0.0.0")
 MASTER_PORT = int(os.environ.get("MASTER_PORT", "8000"))
 ENCODE_TIMEOUT = float(os.environ.get("ENCODE_TIMEOUT", "600"))
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3"))
+BENCHMARK_TIMEOUT = float(os.environ.get("BENCHMARK_TIMEOUT", "1800"))
 MASTER_LOG_DIR = os.environ.get("MASTER_LOG_DIR", "logs/")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output/")
 SHARE_DIR = os.environ.get("SHARE_DIR", ".")
@@ -43,6 +47,8 @@ app = FastAPI(title = "Master API")
 registry = WorkerRegistry()
 jobs = {}
 jobs_lock = threading.Lock()
+control_lock = threading.Lock()
+benchmarking = set()
 
 SCHEDULERS = {
     "adaptive": AdaptiveDistributor,
@@ -60,17 +66,17 @@ def get_scheduler_class(name):
     return scheduler_class
 
 class WorkerCreate(BaseModel):
-    id: str
-    address: str
-    port: int
+    id: str = Field(min_length = 1, max_length = 64, pattern = r"^[A-Za-z0-9_-]+$")
+    address: str = Field(min_length = 1)
+    port: int = Field(ge = 1, le = 65535)
 
 class BenchmarkRequest(BaseModel):
-    video_path: str
+    video_path: str = Field(min_length = 1)
     codec: str = "libx264"
     preset: str = "fast"
     crf: int = 24
-    repeat: int = 3
-    delay: float = 1
+    repeat: int = Field(3, ge = 3)
+    delay: float = Field(1, ge = 0)
 
 class JobCreate(BaseModel):
     video_path: str
@@ -421,6 +427,78 @@ def get_job_summary(job, event_count = 20):
             "merge": job.merge,
         }
 
+def get_worker_or_404(worker_id):
+    try:
+        return registry.get_worker(worker_id)
+    except ValueError as e:
+        raise HTTPException(status_code = 404, detail = str(e))
+
+def check_video_path(video_path):
+    try:
+        full_path = resolve_share_path(video_path)
+    except ValueError as e:
+        raise HTTPException(status_code = 400, detail = str(e))
+
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code = 404, detail = f"Video {video_path} not found in {SHARE_DIR}.")
+
+    return full_path
+
+def ping_worker(address, port):
+    try:
+        response = requests.get(f"http://{address}:{port}/health", timeout = HEALTH_TIMEOUT)
+        return response.json() if response.ok else {"status": f"HTTP {response.status_code}"}
+    except (requests.RequestException, ValueError):
+        return {"status": "unreachable"}
+
+@contextmanager
+def benchmark_session(worker_ids):
+    worker_ids = set(worker_ids)
+
+    with control_lock:
+        if get_active_job():
+            raise HTTPException(status_code = 409, detail = "A job is running, benchmark would disturb the measurement.")
+
+        busy = sorted(worker_ids & benchmarking)
+
+        if busy:
+            raise HTTPException(status_code = 409, detail = f"Benchmark already running on worker(s): {busy}")
+
+        benchmarking.update(worker_ids)
+
+    try:
+        yield
+    finally:
+        with control_lock:
+            benchmarking.difference_update(worker_ids)
+
+def run_benchmark(worker_id, req):
+    try:
+        return registry.benchmark_worker(
+            worker_id,
+            req.video_path,
+            codec = req.codec,
+            preset = req.preset,
+            crf = req.crf,
+            repeat = req.repeat,
+            delay = req.delay,
+            timeout = (HEALTH_TIMEOUT, BENCHMARK_TIMEOUT),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code = 400, detail = str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code = 502, detail = f"Worker {worker_id} responded {e.response.status_code}: {e.response.text[:300]}")
+    except requests.Timeout:
+        raise HTTPException(status_code = 504, detail = f"Worker {worker_id} timed out (limit {BENCHMARK_TIMEOUT}s).")
+    except requests.RequestException as e:
+        raise HTTPException(status_code = 502, detail = f"Worker {worker_id} unreachable: {e}")
+
+def benchmark_key(req):
+    return (normalize_file_path(req.video_path), req.codec, req.preset, str(req.crf))
+
+def summarize_benchmark(result):
+    return {"setting": result["setting"], "benchmark_summary": result["benchmark_summary"]}
+
 @app.get("/schedulers")
 def list_schedulers():
     return {"schedulers": sorted(SCHEDULERS)}
@@ -439,11 +517,7 @@ def list_workers(check_health: bool = False):
         }
 
         if check_health:
-            try:
-                response = requests.get(f"http://{worker.address}:{worker.port}/health", timeout = HEALTH_TIMEOUT)
-                item["health"] = response.json() if response.ok else {"status": f"HTTP {response.status_code}"}
-            except requests.RequestException:
-                item["health"] = {"status": "unreachable"}
+            item["health"] = ping_worker(worker.address, worker.port)
 
         result.append(item)
 
@@ -458,6 +532,40 @@ def add_worker(request: WorkerCreate):
 
     return {"id": worker.id, "address": worker.address, "port": worker.port}
 
+@app.post("/workers/batch", status_code = 201)
+def add_workers_batch(request: list[WorkerCreate], check_health: bool = False):
+    if not request:
+        raise HTTPException(status_code = 422, detail = "Request body must contain at least one worker.")
+
+    if check_health:
+        unhealthy = []
+
+        for w in request:
+            health = ping_worker(w.address, w.port)
+
+            if health.get("status") != "ok":
+                unhealthy.append({"id": w.id, "address": w.address, "port": w.port, "health": health})
+
+        if unhealthy:
+            raise HTTPException(status_code = 502, detail = {
+                "message": "Some workers are not healthy, nothing was added.",
+                "workers": unhealthy,
+            })
+
+    try:
+        workers = registry.add_workers([w.model_dump() for w in request])
+    except WorkerConflictError as e:
+        raise HTTPException(status_code = 409, detail = {
+            "message": f"{e}. Nothing was added.",
+            "duplicates": e.duplicates,
+            "existing": e.existing,
+        })
+
+    return {
+        "total": len(workers),
+        "added": [{"id": w.id, "address": w.address, "port": w.port} for w in workers],
+    }
+
 @app.delete("/workers/{worker_id}")
 def remove_worker(worker_id: str):
     try:
@@ -469,60 +577,92 @@ def remove_worker(worker_id: str):
 
 @app.post("/workers/{worker_id}/benchmark")
 def benchmark_worker(worker_id: str, request: BenchmarkRequest):
-    if get_active_job():
-        raise HTTPException(status_code = 409, detail = "A job is running, benchmark would disturb the measurement.")
+    get_worker_or_404(worker_id)
+    check_video_path(request.video_path)
 
-    try:
-        registry.get_worker(worker_id)
-        return registry.benchmark_worker(
-            worker_id,
-            request.video_path,
-            codec = request.codec,
-            preset = request.preset,
-            crf = request.crf,
-            repeat = request.repeat,
-            delay = request.delay,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code = 400, detail = str(e))
-    except requests.HTTPError as e:
-        raise HTTPException(status_code = 502, detail = f"Worker {worker_id} responded {e.response.status_code}: {e.response.text[:300]}")
-    except requests.RequestException as e:
-        raise HTTPException(status_code = 502, detail = f"Worker {worker_id} unreachable: {e}")
+    with benchmark_session([worker_id]):
+        return run_benchmark(worker_id, request)
 
 @app.post("/workers/{worker_id}/benchmark/batch")
-def benchmark_worker_batch(worker_id: str, request: list[BenchmarkRequest]):
-    if get_active_job():
-        raise HTTPException(status_code = 409, detail = "A job is running, benchmark would disturb the measurement.")
+def benchmark_worker_batch(worker_id: str, request: list[BenchmarkRequest], stop_on_error: bool = False, cooldown: float = Query(0, ge = 0), detail: bool = False):
+    if not request:
+        raise HTTPException(status_code = 422, detail = "Request body must contain at least one benchmark item.")
 
-    results = []
+    get_worker_or_404(worker_id)
 
-    try:
-        for req in request:
-            registry.get_worker(worker_id)
-            results.append(registry.benchmark_worker(
-                worker_id,
-                req.video_path,
-                codec = req.codec,
-                preset = req.preset,
-                crf = req.crf,
-                repeat = req.repeat,
-                delay = req.delay,
-            ))
-        
-        return results
-    except ValueError as e:
-        raise HTTPException(status_code = 400, detail = str(e))
-    except requests.HTTPError as e:
-        raise HTTPException(status_code = 502, detail = f"Worker {worker_id} responded {e.response.status_code}: {e.response.text[:300]}")
-    except requests.RequestException as e:
-        raise HTTPException(status_code = 502, detail = f"Worker {worker_id} unreachable: {e}")
+    errors = []
+    seen = {}
+
+    for index, req in enumerate(request):
+        try:
+            check_video_path(req.video_path)
+        except HTTPException as e:
+            errors.append({"index": index, "video_path": req.video_path, "error": e.detail})
+            continue
+
+        key = benchmark_key(req)
+
+        if key in seen:
+            errors.append({"index": index, "video_path": req.video_path, "error": f"Duplicate of item {seen[key]} (same file, codec, preset, crf)."})
+        else:
+            seen[key] = index
+
+    if errors:
+        raise HTTPException(status_code = 400, detail = {
+            "message": "Invalid batch, nothing was benchmarked.",
+            "errors": errors,
+        })
+
+    items = []
+    stopped = False
+
+    with benchmark_session([worker_id]):
+        for index, req in enumerate(request):
+            item = {
+                "index": index,
+                "video_path": req.video_path,
+                "codec": req.codec,
+                "preset": req.preset,
+                "crf": req.crf,
+            }
+
+            if stopped:
+                item["status"] = "skipped"
+                items.append(item)
+                continue
+
+            if index > 0 and cooldown > 0:
+                time.sleep(cooldown)
+
+            try:
+                result = run_benchmark(worker_id, req)
+                item["status"] = "ok"
+                item["result"] = result if detail else summarize_benchmark(result)
+            except HTTPException as e:
+                item["status"] = "error"
+                item["status_code"] = e.status_code
+                item["error"] = e.detail
+                stopped = stop_on_error
+
+            items.append(item)
+
+    counts = {s: sum(1 for i in items if i["status"] == s) for s in ("ok", "error", "skipped")}
+    response = {
+        "worker_id": worker_id,
+        "total": len(items),
+        "succeeded": counts["ok"],
+        "failed": counts["error"],
+        "skipped": counts["skipped"],
+        "items": items,
+    }
+
+    if counts["ok"] == 0:
+        raise HTTPException(status_code = 502, detail = response)
+
+    return response
 
 @app.post("/jobs")
 def create_job(request: JobCreate):
-    if get_active_job():
-        raise HTTPException(status_code = 409, detail = "Another job is still running.")
-
     try:
         scheduler_class = get_scheduler_class(request.scheduler)
     except ValueError as e:
@@ -536,28 +676,35 @@ def create_job(request: JobCreate):
     if not os.path.isfile(video_path):
         raise HTTPException(status_code = 404, detail = f"Video {request.video_path} not found in {SHARE_DIR}.")
 
-    try:
-        load_start = time.time()
-        video_information = VideoInformation(video_path).get_video_information()
-        load_time = time.time() - load_start
-        distributor = scheduler_class(
-            registry,
-            video_information,
-            codec = request.codec,
-            preset = request.preset,
-            crf = request.crf,
-            max_retries = request.max_retries,
-        )
-        job = Job(uuid.uuid4().hex[:8], request, distributor, {worker.id: worker for worker in registry.list_workers()})
-        job.load_video_time = round(load_time, 3)
+    with control_lock:
+        if get_active_job():
+            raise HTTPException(status_code = 409, detail = "Another job is still running.")
 
-        with job.cond:
-            distributor.initial_assignment(initial_size = request.initial_size)
-    except (ValueError, RuntimeError) as e:
-        raise HTTPException(status_code = 400, detail = str(e))
+        if benchmarking:
+            raise HTTPException(status_code = 409, detail = f"Benchmark is running on worker(s) {sorted(benchmarking)}, wait until it finishes.")
 
-    with jobs_lock:
-        jobs[job.job_id] = job
+        try:
+            load_start = time.time()
+            video_information = VideoInformation(video_path).get_video_information()
+            load_time = time.time() - load_start
+            distributor = scheduler_class(
+                registry,
+                video_information,
+                codec = request.codec,
+                preset = request.preset,
+                crf = request.crf,
+                max_retries = request.max_retries,
+            )
+            job = Job(uuid.uuid4().hex[:8], request, distributor, {worker.id: worker for worker in registry.list_workers()})
+            job.load_video_time = round(load_time, 3)
+
+            with job.cond:
+                distributor.initial_assignment(initial_size = request.initial_size)
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(status_code = 400, detail = str(e))
+
+        with jobs_lock:
+            jobs[job.job_id] = job
 
     job.log(f"job dibuat: scheduler {job.scheduler}, {len(distributor.segments)} segmen, {len(job.workers)} worker")
     threading.Thread(target = run_job, args = (job,), daemon = True).start()

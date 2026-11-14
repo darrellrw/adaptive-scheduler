@@ -1,5 +1,8 @@
 import os
 import math
+import threading
+from collections import Counter
+
 import requests
 
 def normalize_file_path(file_path):
@@ -144,59 +147,70 @@ class WorkerProfile:
 
         return result
 
+class WorkerConflictError(ValueError):
+    def __init__(self, duplicates, existing):
+        self.duplicates = duplicates
+        self.existing = existing
+        parts = []
+
+        if duplicates:
+            parts.append(f"duplicate IDs in request: {duplicates}")
+
+        if existing:
+            parts.append(f"IDs already registered: {existing}")
+
+        super().__init__("; ".join(parts))
+
 class WorkerRegistry:
     def __init__(self):
         self.workers = {}
+        self.lock = threading.RLock()
 
     def add_worker(self, id, address, port):
-        if id in self.workers:
-            raise ValueError(f"Worker with ID {id} already exists.")
-        worker = WorkerProfile(id, address, port)
-        self.workers[id] = worker
-        return worker
+        with self.lock:
+            if id in self.workers:
+                raise ValueError(f"Worker with ID {id} already exists.")
+
+            worker = WorkerProfile(id, address, port)
+            self.workers[id] = worker
+            return worker
+
+    def add_workers(self, items):
+        ids = [item["id"] for item in items]
+        duplicates = sorted(i for i, n in Counter(ids).items() if n > 1)
+
+        with self.lock:
+            existing = sorted({i for i in ids if i in self.workers})
+
+            if duplicates or existing:
+                raise WorkerConflictError(duplicates, existing)
+
+            added = []
+
+            for item in items:
+                worker = WorkerProfile(item["id"], item["address"], item["port"])
+                self.workers[worker.id] = worker
+                added.append(worker)
+
+            return added
 
     def remove_worker(self, id):
-        if id not in self.workers:
-            raise ValueError(f"Worker with ID {id} does not exist.")
-        return self.workers.pop(id)
+        with self.lock:
+            if id not in self.workers:
+                raise ValueError(f"Worker with ID {id} does not exist.")
+
+            return self.workers.pop(id)
 
     def get_worker(self, id):
-        if id not in self.workers:
-            raise ValueError(f"Worker with ID {id} does not exist.")
-        return self.workers[id]
+        with self.lock:
+            if id not in self.workers:
+                raise ValueError(f"Worker with ID {id} does not exist.")
+
+            return self.workers[id]
 
     def list_workers(self):
-        return list(self.workers.values())
-
-    def benchmark_worker(self, id, video_path, codec = "libx264", preset = "fast", crf = 24, repeat = 3, delay = 1, print_info = False):
-        if repeat < 3:
-            raise ValueError("repeat must be at least 3 for benchmarking.")
-
-        worker = self.get_worker(id)
-        url = f"http://{worker.address}:{worker.port}/benchmark"
-        response = requests.post(url, json = {
-            "video_path": video_path,
-            "codec": codec,
-            "preset": preset,
-            "crf": crf,
-            "repeat": repeat,
-            "delay": delay
-        })
-        response.raise_for_status()
-        benchmark_result = response.json()
-
-        benchmark_result["setting"]["file_path"] = normalize_file_path(video_path)
-        worker.add_benchmark(benchmark_result)
-
-        if print_info:
-            print(f"\nBenchmarking completed for worker {id} with file: {video_path}, codec: {codec}, preset: {preset}, crf: {crf}")
-            print(f"Average encoding FPS: {benchmark_result['benchmark_summary']['average_encoding_fps']} fps")
-            print(f"Encoding FPS stddev: {benchmark_result['benchmark_summary']['stddev_encoding_fps']} fps")
-
-            merged = worker.get_benchmark(codec, preset, crf)["benchmark_summary"]
-            print(f"Merged over {merged['total_files']} file(s): {merged['average_encoding_fps']} ± {merged['stddev_encoding_fps']} fps ({merged['total_runs']} runs)")
-
-        return benchmark_result
+        with self.lock:
+            return list(self.workers.values())
 
     def benchmark_worker_dummy(self, id, codec = "libx264", preset = "fast", crf = 24, avg_fps = 30.0, stddev_fps = 2.0, total_runs = 3, file_path = None, print_info = False):
         worker = self.get_worker(id)
