@@ -212,6 +212,36 @@ class WorkerRegistry:
         with self.lock:
             return list(self.workers.values())
 
+    def benchmark_worker(self, id, video_path, codec = "libx264", preset = "fast", crf = 24, repeat = 3, delay = 1, print_info = False):
+        if repeat < 3:
+            raise ValueError("repeat must be at least 3 for benchmarking.")
+
+        worker = self.get_worker(id)
+        url = f"http://{worker.address}:{worker.port}/benchmark"
+        response = requests.post(url, json = {
+            "video_path": video_path,
+            "codec": codec,
+            "preset": preset,
+            "crf": crf,
+            "repeat": repeat,
+            "delay": delay
+        })
+        response.raise_for_status()
+        benchmark_result = response.json()
+
+        benchmark_result["setting"]["file_path"] = normalize_file_path(video_path)
+        worker.add_benchmark(benchmark_result)
+
+        if print_info:
+            print(f"\nBenchmarking completed for worker {id} with file: {video_path}, codec: {codec}, preset: {preset}, crf: {crf}")
+            print(f"Average encoding FPS: {benchmark_result['benchmark_summary']['average_encoding_fps']} fps")
+            print(f"Encoding FPS stddev: {benchmark_result['benchmark_summary']['stddev_encoding_fps']} fps")
+
+            merged = worker.get_benchmark(codec, preset, crf)["benchmark_summary"]
+            print(f"Merged over {merged['total_files']} file(s): {merged['average_encoding_fps']} ± {merged['stddev_encoding_fps']} fps ({merged['total_runs']} runs)")
+
+        return benchmark_result
+
     def benchmark_worker_dummy(self, id, codec = "libx264", preset = "fast", crf = 24, avg_fps = 30.0, stddev_fps = 2.0, total_runs = 3, file_path = None, print_info = False):
         worker = self.get_worker(id)
         dummy_benchmark = {
