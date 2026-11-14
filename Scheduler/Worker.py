@@ -212,7 +212,7 @@ class WorkerRegistry:
         with self.lock:
             return list(self.workers.values())
 
-    def benchmark_worker(self, id, video_path, codec = "libx264", preset = "fast", crf = 24, repeat = 3, delay = 1, print_info = False):
+    def benchmark_worker(self, id, video_path, codec = "libx264", preset = "fast", crf = 24, repeat = 3, delay = 1, timeout = None, print_info = False):
         if repeat < 3:
             raise ValueError("repeat must be at least 3 for benchmarking.")
 
@@ -225,7 +225,8 @@ class WorkerRegistry:
             "crf": crf,
             "repeat": repeat,
             "delay": delay
-        })
+        }, timeout = timeout)
+
         response.raise_for_status()
         benchmark_result = response.json()
 
