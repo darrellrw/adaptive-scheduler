@@ -3,10 +3,12 @@ import csv
 import json
 import time
 import uuid
+import random
 import logging
 import threading
 from contextlib import contextmanager
 from datetime import datetime
+from typing import List, Optional, Union
 
 import requests
 import uvicorn
@@ -95,6 +97,39 @@ class JobCreate(BaseModel):
     crf: int = 24
     initial_size: int = 1
     max_retries: int = 3
+
+class EncoderConfig(BaseModel):
+    label: Optional[str] = None
+    codec: str = Field(min_length = 1)
+    preset: Union[str, int, List[Union[str, int]]] = "fast"
+    crf: Union[int, List[int]] = 24
+
+class ExperimentCreate(BaseModel):
+    name: str = Field("experiment", min_length = 1, max_length = 64, pattern = r"^[A-Za-z0-9_-]+$")
+
+    workers: List[WorkerCreate] = []
+    check_health: bool = True
+
+    encoders: List[EncoderConfig] = Field(min_length = 1)
+
+    benchmark_videos: List[str] = []
+    benchmark_repeat: int = Field(5, ge = 3)
+    benchmark_delay: float = Field(1, ge = 0)
+    benchmark_cooldown: float = Field(0, ge = 0)
+    benchmark_parallel: bool = False
+    skip_existing_benchmark: bool = True
+
+    video_path: Optional[str] = None
+    schedulers: List[str] = ["static", "dynamic", "adaptive"]
+    repetitions: int = Field(1, ge = 1)
+    shuffle: bool = True
+    seed: Optional[int] = None
+    job_cooldown: float = Field(5, ge = 0)
+    initial_size: int = Field(1, ge = 1)
+    max_retries: int = Field(3, ge = 0)
+    keep_output: bool = True
+
+    stop_on_error: bool = False
 
 TIMELINE_FIELDS = [
     "segment", "attempt", "worker_id", "total_frames", "status",
@@ -603,10 +638,13 @@ def ping_worker(address, port):
         return {"status": "unreachable"}
 
 @contextmanager
-def benchmark_session(worker_ids):
+def benchmark_session(worker_ids, internal = False):
     worker_ids = set(worker_ids)
 
     with control_lock:
+        if not internal and get_active_experiment():
+            raise HTTPException(status_code = 409, detail = "An experiment is running, wait until it finishes or cancel it.")
+
         if get_active_job():
             raise HTTPException(status_code = 409, detail = "A job is running, benchmark would disturb the measurement.")
 
@@ -814,6 +852,10 @@ def benchmark_worker_batch(worker_id: str, request: list[BenchmarkRequest], stop
 
 @app.post("/jobs")
 def create_job(request: JobCreate):
+    job, _ = start_job(request)
+    return {"job_id": job.job_id, "scheduler": job.scheduler, "status": job.status, "total_segments": len(job.distributor.segments)}
+
+def start_job(request, internal = False):
     try:
         scheduler_class = get_scheduler_class(request.scheduler)
     except ValueError as e:
@@ -828,6 +870,9 @@ def create_job(request: JobCreate):
         raise HTTPException(status_code = 404, detail = f"Video {request.video_path} not found in {SHARE_DIR}.")
 
     with control_lock:
+        if not internal and get_active_experiment():
+            raise HTTPException(status_code = 409, detail = "An experiment is running, wait until it finishes or cancel it.")
+
         if get_active_job():
             raise HTTPException(status_code = 409, detail = "Another job is still running.")
 
@@ -858,9 +903,10 @@ def create_job(request: JobCreate):
             jobs[job.job_id] = job
 
     job.log(f"job dibuat: scheduler {job.scheduler}, {len(distributor.segments)} segmen, {len(job.workers)} worker")
-    threading.Thread(target = run_job, args = (job,), daemon = True).start()
+    thread = threading.Thread(target = run_job, args = (job,), daemon = True)
+    thread.start()
 
-    return {"job_id": job.job_id, "scheduler": job.scheduler, "status": job.status, "total_segments": len(distributor.segments)}
+    return job, thread
 
 @app.get("/jobs")
 def list_jobs():
@@ -892,6 +938,584 @@ def get_job_log(job_id: str):
 
     payload["log_files"] = job.log_files
     return payload
+
+SCHEDULER_GROUPS = {
+    "static": ["rr_static", "sjf_static", "hetero_static"],
+    "dynamic": ["fifo_dynamic", "sjf_dynamic", "hetero_dynamic"],
+    "adaptive": ["adaptive"],
+}
+SCHEDULER_GROUPS["all"] = SCHEDULER_GROUPS["static"] + SCHEDULER_GROUPS["dynamic"] + SCHEDULER_GROUPS["adaptive"]
+
+BENCHMARK_FIELDS = [
+    "worker_id", "video_path", "label", "codec", "preset", "crf", "status",
+    "average_encoding_fps", "stddev_encoding_fps", "total_runs", "average_encoding_time", "duration", "error",
+]
+
+RUN_FIELDS = [
+    "run", "repetition", "scheduler", "group", "label", "codec", "preset", "crf",
+    "job_id", "status", "error", "makespan", "overall_fps", "load_video_time", "merge_time", "total_time",
+    "attempts", "completed_segments", "failures", "output_size_bytes",
+    "worker_frames", "worker_utilization", "worker_idle_time", "log_json",
+]
+
+experiments = {}
+experiments_lock = threading.Lock()
+
+def get_active_experiment():
+    with experiments_lock:
+        for experiment in experiments.values():
+            if experiment.status in ("pending", "running"):
+                return experiment
+
+    return None
+
+def scheduler_group(name):
+    for group in ("static", "dynamic", "adaptive"):
+        if name in SCHEDULER_GROUPS[group]:
+            return group
+
+    return "other"
+
+def expand_schedulers(names):
+    result = []
+
+    for name in names:
+        for item in SCHEDULER_GROUPS.get(name, [name]):
+            get_scheduler_class(item)
+
+            if item not in result:
+                result.append(item)
+
+    if not result:
+        raise ValueError("No scheduler selected.")
+
+    return result
+
+def as_list(value):
+    return value if isinstance(value, list) else [value]
+
+def expand_encoders(encoders):
+    configs = []
+    seen = set()
+
+    for encoder in encoders:
+        for preset in as_list(encoder.preset):
+            for crf in as_list(encoder.crf):
+                key = (encoder.codec, str(preset), int(crf))
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+                configs.append({
+                    "label": encoder.label or encoder.codec,
+                    "codec": encoder.codec,
+                    "preset": str(preset),
+                    "crf": int(crf),
+                })
+
+    return configs
+
+def build_run_plan(request, configs, schedulers):
+    rng = random.Random(request.seed)
+    plan = []
+
+    for repetition in range(1, request.repetitions + 1):
+        for config in configs:
+            order = list(schedulers)
+
+            if request.shuffle:
+                rng.shuffle(order)
+
+            for scheduler in order:
+                plan.append({"repetition": repetition, "config": config, "scheduler": scheduler})
+
+    return plan
+
+class Experiment:
+    def __init__(self, experiment_id, request, configs, schedulers, plan):
+        self.experiment_id = experiment_id
+        self.request = request
+        self.configs = configs
+        self.schedulers = schedulers
+        self.plan = plan
+        self.status = "pending"
+        self.phase = "pending"
+        self.error = None
+        self.current = None
+        self.registered = []
+        self.benchmarks = []
+        self.runs = []
+        self.events = []
+        self.log_files = {}
+        self.created_at = time.time()
+        self.finished_at = None
+        self.lock = threading.RLock()
+        self.cancel_event = threading.Event()
+
+    def elapsed(self):
+        return (self.finished_at or time.time()) - self.created_at
+
+    def log(self, message):
+        with self.lock:
+            line = f"[{time.time() - self.created_at:9.2f}s] {message}"
+            self.events.append(line)
+            del self.events[:-300]
+
+        logger.info("[experiment %s] %s", self.experiment_id, line)
+
+    def benchmark_total(self):
+        return len(registry.list_workers()) * len(self.request.benchmark_videos) * len(self.configs)
+
+    def snapshot(self, event_count = 30):
+        with self.lock:
+            return {
+                "experiment_id": self.experiment_id,
+                "name": self.request.name,
+                "status": self.status,
+                "phase": self.phase,
+                "error": self.error,
+                "current": self.current,
+                "elapsed": round(self.elapsed(), 3),
+                "progress": {
+                    "benchmarks_done": len(self.benchmarks),
+                    "benchmarks_total": self.benchmark_total(),
+                    "runs_done": len(self.runs),
+                    "runs_total": len(self.plan),
+                },
+                "configs": self.configs,
+                "schedulers": self.schedulers,
+                "workers": [w.id for w in registry.list_workers()],
+                "registered": self.registered,
+                "benchmarks": list(self.benchmarks),
+                "runs": list(self.runs),
+                "log_files": self.log_files,
+                "events": self.events[-event_count:] if event_count else [],
+            }
+
+def write_experiment_log(experiment):
+    name = f"experiment_{experiment.request.name}_{experiment.experiment_id}"
+
+    try:
+        os.makedirs(MASTER_LOG_DIR, exist_ok = True)
+        paths = {
+            "json": os.path.join(MASTER_LOG_DIR, f"{name}.json"),
+            "runs_csv": os.path.join(MASTER_LOG_DIR, f"{name}_runs.csv"),
+            "benchmarks_csv": os.path.join(MASTER_LOG_DIR, f"{name}_benchmarks.csv"),
+        }
+
+        with experiment.lock:
+            payload = experiment.snapshot(event_count = 300)
+            payload["request"] = experiment.request.model_dump()
+            payload["plan"] = experiment.plan
+            payload["fault_detection"] = {
+                "heartbeat_interval": HEARTBEAT_INTERVAL,
+                "heartbeat_misses": HEARTBEAT_MISSES,
+                "health_timeout": HEALTH_TIMEOUT,
+                "encode_timeout": ENCODE_TIMEOUT,
+            }
+            payload["log_files"] = paths
+
+        with open(paths["json"], "w", encoding = "utf-8") as f:
+            json.dump(payload, f, indent = 2, default = str)
+
+        with open(paths["runs_csv"], "w", newline = "", encoding = "utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames = RUN_FIELDS, extrasaction = "ignore")
+            writer.writeheader()
+            writer.writerows(payload["runs"])
+
+        with open(paths["benchmarks_csv"], "w", newline = "", encoding = "utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames = BENCHMARK_FIELDS, extrasaction = "ignore")
+            writer.writeheader()
+            writer.writerows(payload["benchmarks"])
+
+        with experiment.lock:
+            experiment.log_files = paths
+    except OSError as e:
+        logger.error("Gagal menulis log eksperimen %s: %s", experiment.experiment_id, e)
+
+def register_experiment_workers(request):
+    """Validasi lalu daftarkan worker. Worker dengan ID sama dan alamat sama dilewati."""
+    new_items = []
+    existing = []
+    conflicts = []
+
+    for w in request.workers:
+        try:
+            current = registry.get_worker(w.id)
+        except ValueError:
+            new_items.append(w)
+            continue
+
+        if current.address == w.address and int(current.port) == w.port:
+            existing.append(w.id)
+        else:
+            conflicts.append({"id": w.id, "registered": f"{current.address}:{current.port}", "requested": f"{w.address}:{w.port}"})
+
+    if conflicts:
+        raise HTTPException(status_code = 409, detail = {"message": "Worker ID already registered with a different address.", "workers": conflicts})
+
+    if request.check_health:
+        targets = [(w.id, w.address, w.port) for w in new_items] + [(x.id, x.address, x.port) for x in registry.list_workers()]
+        unhealthy = []
+
+        for worker_id, address, port in targets:
+            health = ping_worker(address, port)
+
+            if health.get("status") != "ok":
+                unhealthy.append({"id": worker_id, "address": address, "port": port, "health": health})
+
+        if unhealthy:
+            raise HTTPException(status_code = 502, detail = {"message": "Some workers are not healthy, experiment not started.", "workers": unhealthy})
+
+    try:
+        added = registry.add_workers([w.model_dump() for w in new_items]) if new_items else []
+    except WorkerConflictError as e:
+        raise HTTPException(status_code = 409, detail = str(e))
+
+    return [{"id": w.id, "status": "added"} for w in added] + [{"id": i, "status": "existing"} for i in existing]
+
+def benchmark_worker_items(experiment, worker_id, items):
+    request = experiment.request
+    worker = registry.get_worker(worker_id)
+
+    for index, (video_path, config) in enumerate(items):
+        if experiment.cancel_event.is_set():
+            return
+
+        row = {
+            "worker_id": worker_id,
+            "video_path": video_path,
+            "label": config["label"],
+            "codec": config["codec"],
+            "preset": config["preset"],
+            "crf": config["crf"],
+        }
+        key = (normalize_file_path(video_path), config["codec"], config["preset"], str(config["crf"]))
+
+        if request.skip_existing_benchmark and key in worker.benchmark:
+            summary = worker.benchmark[key]["benchmark_summary"]
+            row.update(status = "skipped_existing", duration = 0.0)
+        else:
+            if index > 0 and request.benchmark_cooldown > 0:
+                experiment.cancel_event.wait(request.benchmark_cooldown)
+
+            with experiment.lock:
+                experiment.current = {"phase": "benchmark", **row}
+
+            experiment.log(f"BENCH  {worker_id}: {video_path} | {config['codec']} preset {config['preset']} crf {config['crf']}")
+            start = time.time()
+
+            try:
+                req = BenchmarkRequest(
+                    video_path = video_path,
+                    codec = config["codec"],
+                    preset = config["preset"],
+                    crf = config["crf"],
+                    repeat = request.benchmark_repeat,
+                    delay = request.benchmark_delay,
+                )
+
+                with benchmark_session([worker_id], internal = True):
+                    summary = run_benchmark(worker_id, req)["benchmark_summary"]
+
+                row.update(status = "ok", duration = round(time.time() - start, 3))
+            except HTTPException as e:
+                summary = None
+                row.update(status = "error", duration = round(time.time() - start, 3), error = str(e.detail)[:300])
+                experiment.log(f"BENCH  {worker_id} gagal: {row['error']}")
+
+        if summary:
+            row.update(
+                average_encoding_fps = summary.get("average_encoding_fps"),
+                stddev_encoding_fps = summary.get("stddev_encoding_fps"),
+                total_runs = summary.get("total_runs"),
+                average_encoding_time = summary.get("average_encoding_time"),
+            )
+
+        with experiment.lock:
+            experiment.benchmarks.append(row)
+
+        if row["status"] == "error" and request.stop_on_error:
+            experiment.error = f"Benchmark gagal pada {worker_id}: {row['error']}"
+            experiment.cancel_event.set()
+            return
+
+def run_benchmark_phase(experiment):
+    request = experiment.request
+
+    if not request.benchmark_videos:
+        experiment.log("BENCH  dilewati (benchmark_videos kosong), memakai benchmark yang sudah ada")
+        return
+
+    with experiment.lock:
+        experiment.phase = "benchmark"
+
+    # urutan: per konfigurasi encoder, lalu per video
+    items = [(video, config) for config in experiment.configs for video in request.benchmark_videos]
+    worker_ids = [w.id for w in registry.list_workers()]
+
+    if request.benchmark_parallel:
+        threads = [threading.Thread(target = benchmark_worker_items, args = (experiment, worker_id, items), daemon = True) for worker_id in worker_ids]
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+    else:
+        for worker_id in worker_ids:
+            if experiment.cancel_event.is_set():
+                break
+
+            benchmark_worker_items(experiment, worker_id, items)
+
+    write_experiment_log(experiment)
+
+def remove_job_output(job):
+    output_file = (job.merge or {}).get("output_file")
+
+    if output_file and os.path.isfile(output_file):
+        os.remove(output_file)
+
+    try:
+        os.rmdir(os.path.join(RESULT_DIR, job.job_id))
+    except OSError:
+        pass
+
+def run_scheduler_phase(experiment):
+    request = experiment.request
+
+    with experiment.lock:
+        experiment.phase = "scheduling"
+
+    for index, item in enumerate(experiment.plan, start = 1):
+        if experiment.cancel_event.is_set():
+            break
+
+        if index > 1 and request.job_cooldown > 0:
+            if experiment.cancel_event.wait(request.job_cooldown):
+                break
+
+        config = item["config"]
+        row = {
+            "run": index,
+            "repetition": item["repetition"],
+            "scheduler": item["scheduler"],
+            "group": scheduler_group(item["scheduler"]),
+            "label": config["label"],
+            "codec": config["codec"],
+            "preset": config["preset"],
+            "crf": config["crf"],
+        }
+
+        with experiment.lock:
+            experiment.current = {"phase": "scheduling", **row}
+
+        experiment.log(f"RUN    {index}/{len(experiment.plan)} rep {item['repetition']} | {item['scheduler']} | {config['label']} preset {config['preset']} crf {config['crf']}")
+
+        try:
+            job, thread = start_job(JobCreate(
+                video_path = request.video_path,
+                scheduler = item["scheduler"],
+                codec = config["codec"],
+                preset = config["preset"],
+                crf = config["crf"],
+                initial_size = request.initial_size,
+                max_retries = request.max_retries,
+            ), internal = True)
+        except HTTPException as e:
+            row.update(status = "error", error = str(e.detail)[:300])
+            experiment.log(f"RUN    gagal dibuat: {row['error']}")
+
+            with experiment.lock:
+                experiment.runs.append(row)
+
+            write_experiment_log(experiment)
+
+            if request.stop_on_error:
+                experiment.error = row["error"]
+                break
+
+            continue
+
+        thread.join()
+
+        summary = summarize_timeline(job.timeline)
+        merge_time = (job.merge or {}).get("duration") or 0.0
+        output_file = (job.merge or {}).get("output_file")
+        output_size = os.path.getsize(output_file) if output_file and os.path.isfile(output_file) else None
+
+        row.update(
+            job_id = job.job_id,
+            status = job.status,
+            error = job.error,
+            makespan = summary["makespan"],
+            overall_fps = summary["overall_fps"],
+            load_video_time = job.load_video_time,
+            merge_time = merge_time,
+            total_time = round(job.load_video_time + summary["makespan"] + merge_time, 3),
+            attempts = summary["attempts"],
+            completed_segments = summary["completed_segments"],
+            failures = len(job.failures),
+            output_size_bytes = output_size,
+            worker_frames = json.dumps({w: v["frames"] for w, v in summary["workers"].items()}),
+            worker_utilization = json.dumps({w: v["utilization"] for w, v in summary["workers"].items()}),
+            worker_idle_time = json.dumps({w: v["idle_time"] for w, v in summary["workers"].items()}),
+            log_json = job.log_files.get("json"),
+        )
+
+        if not request.keep_output:
+            remove_job_output(job)
+
+        experiment.log(f"RUN    selesai {job.job_id}: {job.status}, makespan {summary['makespan']:.2f}s, {summary['overall_fps']:.2f} fps")
+
+        with experiment.lock:
+            experiment.runs.append(row)
+
+        write_experiment_log(experiment)
+
+        if job.status != "completed" and request.stop_on_error:
+            experiment.error = f"Job {job.job_id} berstatus {job.status}"
+            break
+
+def run_experiment(experiment):
+    with experiment.lock:
+        experiment.status = "running"
+
+    try:
+        run_benchmark_phase(experiment)
+
+        if not experiment.cancel_event.is_set() and experiment.plan:
+            run_scheduler_phase(experiment)
+
+        with experiment.lock:
+            if experiment.error:
+                experiment.status = "failed"
+            elif experiment.cancel_event.is_set():
+                experiment.status = "cancelled"
+            else:
+                experiment.status = "completed"
+    except Exception as e:
+        logger.exception("Experiment %s crashed", experiment.experiment_id)
+
+        with experiment.lock:
+            experiment.status = "failed"
+            experiment.error = str(e)[:300]
+    finally:
+        with experiment.lock:
+            experiment.phase = "done"
+            experiment.current = None
+            experiment.finished_at = time.time()
+
+        experiment.log(f"EXPERIMENT {experiment.status} dalam {experiment.elapsed():.2f}s")
+        write_experiment_log(experiment)
+
+@app.post("/experiments", status_code = 202)
+def create_experiment(request: ExperimentCreate, dry_run: bool = False):
+    try:
+        schedulers = expand_schedulers(request.schedulers)
+    except ValueError as e:
+        raise HTTPException(status_code = 400, detail = str(e))
+
+    configs = expand_encoders(request.encoders)
+
+    for video_path in request.benchmark_videos:
+        check_video_path(video_path)
+
+    if request.video_path:
+        check_video_path(request.video_path)
+        plan = build_run_plan(request, configs, schedulers)
+    else:
+        plan = []
+
+    if not plan and not request.benchmark_videos:
+        raise HTTPException(status_code = 400, detail = "Nothing to do: set video_path (scheduler runs) and/or benchmark_videos.")
+
+    worker_count = len({w.id for w in request.workers} | {w.id for w in registry.list_workers()})
+    preview = {
+        "configs": configs,
+        "schedulers": schedulers,
+        "benchmarks_total": worker_count * len(request.benchmark_videos) * len(configs),
+        "runs_total": len(plan),
+        "plan": [
+            {"run": i, "repetition": p["repetition"], "scheduler": p["scheduler"], **p["config"]}
+            for i, p in enumerate(plan, start = 1)
+        ],
+    }
+
+    if dry_run:
+        return {"dry_run": True, **preview}
+
+    with control_lock:
+        if get_active_experiment():
+            raise HTTPException(status_code = 409, detail = "Another experiment is still running.")
+
+        if get_active_job() or benchmarking:
+            raise HTTPException(status_code = 409, detail = "A job or benchmark is running, wait until it finishes.")
+
+        registered = register_experiment_workers(request)
+
+        if not registry.list_workers():
+            raise HTTPException(status_code = 400, detail = "No worker registered.")
+
+        experiment = Experiment(uuid.uuid4().hex[:8], request, configs, schedulers, plan)
+        experiment.registered = registered
+
+        with experiments_lock:
+            experiments[experiment.experiment_id] = experiment
+
+    experiment.log(
+        f"eksperimen dibuat: {len(registry.list_workers())} worker, {len(configs)} konfigurasi, "
+        f"{len(schedulers)} scheduler, {experiment.benchmark_total()} benchmark, {len(plan)} run"
+    )
+    threading.Thread(target = run_experiment, args = (experiment,), daemon = True).start()
+
+    return {
+        "experiment_id": experiment.experiment_id,
+        "status": experiment.status,
+        "registered": registered,
+        **{k: v for k, v in preview.items() if k != "plan"},
+    }
+
+@app.get("/experiments")
+def list_experiments():
+    with experiments_lock:
+        items = list(experiments.values())
+
+    return [
+        {
+            "experiment_id": e.experiment_id,
+            "name": e.request.name,
+            "status": e.status,
+            "phase": e.phase,
+            "runs_done": len(e.runs),
+            "runs_total": len(e.plan),
+        }
+        for e in items
+    ]
+
+@app.get("/experiments/{experiment_id}")
+def get_experiment(experiment_id: str, events: int = 30):
+    with experiments_lock:
+        experiment = experiments.get(experiment_id)
+
+    if experiment is None:
+        raise HTTPException(status_code = 404, detail = f"Experiment {experiment_id} not found.")
+
+    return experiment.snapshot(event_count = events)
+
+@app.post("/experiments/{experiment_id}/cancel")
+def cancel_experiment(experiment_id: str):
+    with experiments_lock:
+        experiment = experiments.get(experiment_id)
+
+    if experiment is None:
+        raise HTTPException(status_code = 404, detail = f"Experiment {experiment_id} not found.")
+
+    experiment.cancel_event.set()
+    experiment.log("CANCEL diminta, berhenti setelah benchmark/job yang sedang berjalan selesai")
+    return {"experiment_id": experiment_id, "status": experiment.status, "message": "Cancel requested; the current benchmark/job will finish first."}
 
 if __name__ == "__main__":
     uvicorn.run(app, host = MASTER_HOST, port = MASTER_PORT)

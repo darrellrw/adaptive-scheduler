@@ -186,8 +186,6 @@ class BaseStaticDistributor(BaseDistributor):
         return None
 
     def pick_orphan(self):
-        # orphan = segmen pending yang tidak ada di rencana worker mana pun
-        # (segmen gagal, atau milik worker yang hilang)
         planned = {s["segment"] for queue in self.plan.values() for s in queue}
         orphans = [s for s in self.pending_segments if s["segment"] not in planned]
 
@@ -231,7 +229,7 @@ class BaseStaticDistributor(BaseDistributor):
 
     def disable_worker(self, worker_id):
         returned_segments = super().disable_worker(worker_id)
-        # sisa rencana worker yang hilang dilepas sehingga menjadi orphan
+
         self.plan[worker_id].clear()
         return returned_segments
 
