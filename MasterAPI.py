@@ -19,9 +19,12 @@ from Scheduler import (
     WorkerRegistry,
     WorkerConflictError,
     AdaptiveDistributor,
-    FIFODistributor,
-    SJFDistributor,
-    HeterogeneousDistributor,
+    RRStaticDistributor,
+    SJFStaticDistributor,
+    HeteroStaticDistributor,
+    FIFODynamicDistributor,
+    SJFDynamicDistributor,
+    HeteroDynamicDistributor,
     CombineSegments,
 )
 
@@ -30,8 +33,11 @@ from Scheduler.Worker import normalize_file_path
 
 MASTER_HOST = os.environ.get("MASTER_HOST", "0.0.0.0")
 MASTER_PORT = int(os.environ.get("MASTER_PORT", "8000"))
-ENCODE_TIMEOUT = float(os.environ.get("ENCODE_TIMEOUT", "600"))
+ENCODE_TIMEOUT = float(os.environ.get("ENCODE_TIMEOUT", "0")) or None
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3"))
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "2"))
+HEARTBEAT_MISSES = int(os.environ.get("HEARTBEAT_MISSES", "3"))
+POLL_INTERVAL = 0.5
 BENCHMARK_TIMEOUT = float(os.environ.get("BENCHMARK_TIMEOUT", "1800"))
 MASTER_LOG_DIR = os.environ.get("MASTER_LOG_DIR", "logs/")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output/")
@@ -52,9 +58,12 @@ benchmarking = set()
 
 SCHEDULERS = {
     "adaptive": AdaptiveDistributor,
-    "fifo": FIFODistributor,
-    "sjf": SJFDistributor,
-    "heterogeneous": HeterogeneousDistributor,
+    "rr_static": RRStaticDistributor,
+    "sjf_static": SJFStaticDistributor,
+    "hetero_static": HeteroStaticDistributor,
+    "fifo_dynamic": FIFODynamicDistributor,
+    "sjf_dynamic": SJFDynamicDistributor,
+    "hetero_dynamic": HeteroDynamicDistributor,
 }
 
 def get_scheduler_class(name):
@@ -233,6 +242,9 @@ class Job:
         self.cond = threading.Condition()
         self.load_video_time = 0.0
         self.merge = None
+        self.failures = []
+        self.last_seen = {worker_id: 0.0 for worker_id in workers}
+        self.stop_event = threading.Event()
         self.worker_benchmarks = snapshot_worker_benchmarks(workers, distributor, request.codec, request.preset, request.crf)
 
     def elapsed(self):
@@ -279,7 +291,7 @@ def send_encode(worker, job, segment):
             "preset": job.preset,
             "crf": job.crf,
         },
-        timeout = ENCODE_TIMEOUT,
+        timeout = (HEALTH_TIMEOUT, ENCODE_TIMEOUT),
     )
 
     if not response.ok:
@@ -291,6 +303,90 @@ def send_encode(worker, job, segment):
         raise RuntimeError(f"Invalid encoding_time in response: {result}")
 
     return result
+
+class EncodeCall:
+    def __init__(self, worker, job, segment):
+        self.result = None
+        self.error = None
+        self.done = threading.Event()
+        self.thread = threading.Thread(target = self.run, args = (worker, job, segment), daemon = True)
+
+    def run(self, worker, job, segment):
+        try:
+            self.result = send_encode(worker, job, segment)
+        except Exception as e:
+            self.error = e
+        finally:
+            self.done.set()
+
+    def start(self):
+        self.thread.start()
+        return self
+
+def mark_worker_lost(job, worker_id, method, reason):
+    with job.cond:
+        distributor = job.distributor
+
+        if not distributor.state[worker_id]["active"]:
+            return False
+
+        detected_at = job.elapsed()
+        last_seen = job.last_seen.get(worker_id, 0.0)
+        open_records = [r for r in job.timeline if r["worker_id"] == worker_id and r["end"] is None]
+
+        for record in open_records:
+            job.end_record(record, "worker_lost", error = f"{method}: {reason}")
+
+        returned = distributor.disable_worker(worker_id)
+
+        failure = {
+            "worker_id": worker_id,
+            "method": method,
+            "reason": reason,
+            "last_seen": round(last_seen, 3),
+            "detected_at": round(detected_at, 3),
+            "detection_latency": round(detected_at - last_seen, 3),
+            "returned_segments": [s["segment"] for s in returned],
+            "lost_frames": sum(r["total_frames"] for r in open_records),
+            "lost_work_time": round(sum(r["wall_time"] for r in open_records), 3),
+        }
+        job.failures.append(failure)
+        job.log(
+            f"LOST   {worker_id} via {method} ({reason}), terakhir hidup t={last_seen:.2f}s, "
+            f"latensi deteksi {failure['detection_latency']:.2f}s, segmen dikembalikan: {failure['returned_segments']}"
+        )
+
+        if not distributor.get_active_workers():
+            job.error = "Semua worker tidak terjangkau."
+
+        job.cond.notify_all()
+        return True
+
+def heartbeat_loop(job, worker_id):
+    worker = job.workers[worker_id]
+    distributor = job.distributor
+    misses = 0
+
+    while not job.stop_event.is_set():
+        with job.cond:
+            if not distributor.state[worker_id]["active"] or distributor.is_finished():
+                return
+
+        health = ping_worker(worker.address, worker.port)
+
+        if health.get("status") == "ok":
+            misses = 0
+
+            with job.cond:
+                job.last_seen[worker_id] = job.elapsed()
+        else:
+            misses += 1
+
+            if misses >= HEARTBEAT_MISSES:
+                mark_worker_lost(job, worker_id, "heartbeat", f"{misses}x ping gagal ({health.get('status')})")
+                return
+
+        job.stop_event.wait(HEARTBEAT_INTERVAL)
 
 def worker_loop(job, worker_id):
     worker = job.workers[worker_id]
@@ -313,30 +409,33 @@ def worker_loop(job, worker_id):
             record = job.begin_record(worker_id, segment)
             job.log(f"START  segmen {segment['segment']} (percobaan {record['attempt']}, {segment['total_frames']} frame) -> {worker_id}")
 
-        try:
-            result = send_encode(worker, job, segment)
-        except (requests.ConnectionError, requests.Timeout) as e:
+        call = EncodeCall(worker, job, segment).start()
+
+        while not call.done.wait(timeout = POLL_INTERVAL):
             with job.cond:
-                job.end_record(record, "worker_lost", error = type(e).__name__)
-                returned = distributor.disable_worker(worker_id)
-                job.log(f"LOST   {worker_id} tidak terjangkau ({type(e).__name__}) setelah {record['wall_time']:.2f}s, segmen dikembalikan: {[s['segment'] for s in returned]}")
-
-                if not distributor.get_active_workers():
-                    job.error = "Semua worker tidak terjangkau."
-
-                job.cond.notify_all()
-
-            return
-        except Exception as e:
-            with job.cond:
-                job.end_record(record, "failed", error = str(e)[:300])
-                accepted = distributor.fail_segment(worker_id, segment)
-                job.log(f"FAILED segmen {segment['segment']} di {worker_id} setelah {record['wall_time']:.2f}s ({'dicoba ulang' if accepted else 'menyerah'}): {e}")
-                job.cond.notify_all()
-
-            continue
+                if not distributor.state[worker_id]["active"]:
+                    # heartbeat sudah menyatakan worker hilang, hasil request (jika datang) diabaikan
+                    return
 
         with job.cond:
+            if not distributor.state[worker_id]["active"]:
+                return
+
+            error = call.error
+
+            if isinstance(error, (requests.ConnectionError, requests.Timeout)):
+                mark_worker_lost(job, worker_id, "connection", type(error).__name__)
+                return
+
+            if error is not None:
+                job.end_record(record, "failed", error = str(error)[:300])
+                accepted = distributor.fail_segment(worker_id, segment)
+                job.log(f"FAILED segmen {segment['segment']} di {worker_id} setelah {record['wall_time']:.2f}s ({'dicoba ulang' if accepted else 'menyerah'}): {error}")
+                job.cond.notify_all()
+                continue
+
+            result = call.result
+            job.last_seen[worker_id] = job.elapsed()
             job.end_record(record, "completed", result = result)
             distributor.complete_segment(worker_id, segment, result["encoding_time"])
             job.results[segment["segment"]] = {
@@ -375,19 +474,40 @@ def build_job_log(job):
         "workers": list(job.workers),
         "worker_benchmarks": job.worker_benchmarks,
         "merge": job.merge,
+        "fault_detection": {
+            "heartbeat_interval": HEARTBEAT_INTERVAL,
+            "heartbeat_misses": HEARTBEAT_MISSES,
+            "health_timeout": HEALTH_TIMEOUT,
+            "encode_timeout": ENCODE_TIMEOUT,
+        },
+        "failures": job.failures,
     }
 
 def run_job(job):
+    worker_ids = job.distributor.get_active_workers()
+
+    with job.cond:
+        start = job.elapsed()
+
+        for worker_id in worker_ids:
+            job.last_seen[worker_id] = start
+
     threads = [
         threading.Thread(target = worker_loop, args = (job, worker_id), daemon = True)
-        for worker_id in job.distributor.get_active_workers()
+        for worker_id in worker_ids
+    ]
+    heartbeats = [
+        threading.Thread(target = heartbeat_loop, args = (job, worker_id), daemon = True)
+        for worker_id in worker_ids
     ]
 
-    for thread in threads:
+    for thread in threads + heartbeats:
         thread.start()
 
     for thread in threads:
         thread.join()
+
+    job.stop_event.set()
 
     with job.cond:
         status = job.distributor.get_status()
@@ -455,6 +575,7 @@ def get_job_summary(job, event_count = 20):
             "results": [job.results[key] for key in sorted(job.results)],
             "events": job.events[-event_count:],
             "merge": job.merge,
+            "failures": job.failures,
         }
 
 def get_worker_or_404(worker_id):

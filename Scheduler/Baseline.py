@@ -38,14 +38,6 @@ class BaseDistributor:
         if not self.state:
             raise ValueError("No valid workers available for distribution.")
 
-        self.plan = {worker_id: deque(segments) for worker_id, segments in self.build_plan().items()}
-
-    def build_plan(self):
-        raise NotImplementedError
-
-    def orphan_choice(self, orphans):
-        return orphans[0]
-
     def get_estimated_time(self, worker_id):
         if worker_id not in self.state:
             raise ValueError(f"Worker {worker_id} is not part of the distribution state.")
@@ -100,6 +92,88 @@ class BaseDistributor:
         self.add_load(worker_id, segment)
         self.pending_segments.remove(segment)
 
+    def complete_segment(self, worker_id, segment, encoding_time):
+        if encoding_time <= 0:
+            raise ValueError("Encoding time must be greater than zero.")
+
+        self.release_load(worker_id, segment)
+
+    def fail_segment(self, worker_id, segment, count_retry = True):
+        self.check_running(worker_id, segment)
+
+        worker_state = self.state[worker_id]
+        worker_state["assigned_segments"].remove(segment)
+        worker_state["remaining_frames"] -= segment["total_frames"]
+
+        if count_retry:
+            segment_id = segment["segment"]
+            self.retry_count[segment_id] = self.retry_count.get(segment_id, 0) + 1
+
+            if self.retry_count[segment_id] > self.max_retries:
+                self.failed_segments.append(segment)
+                return False
+
+        self.pending_segments.append(segment)
+        return True
+
+    def disable_worker(self, worker_id):
+        self.state[worker_id]["active"] = False
+        returned_segments = []
+
+        for segment in self.get_running_segments(worker_id):
+            if self.fail_segment(worker_id, segment, count_retry = False):
+                returned_segments.append(segment)
+
+        return returned_segments
+
+    def get_idle_workers(self):
+        return [worker_id for worker_id in self.get_active_workers() if not self.get_running_segments(worker_id)]
+
+    def is_finished(self):
+        if self.pending_segments:
+            return False
+
+        return all(not self.get_running_segments(worker_id) for worker_id in self.state)
+
+    def get_status(self):
+        completed = sum(len(s["completed_segments"]) for s in self.state.values())
+        running = sum(len(self.get_running_segments(worker_id)) for worker_id in self.state)
+
+        return {
+            "total_segments": len(self.segments),
+            "completed": completed,
+            "running": running,
+            "pending": len(self.pending_segments),
+            "failed": len(self.failed_segments),
+            "finished": self.is_finished(),
+            "workers": {
+                worker_id: {
+                    "active": s["active"],
+                    "avg_fps": s["avg_fps"],
+                    "stddev_fps": s["stddev_fps"],
+                    "cv": self.get_coefficient(worker_id),
+                    "planning_fps": s["planning_fps"],
+                    "sample_count": s["sample_count"],
+                    "remaining_frames": s["remaining_frames"],
+                    "estimated_time": self.get_estimated_time(worker_id),
+                    "running_segments": [seg["segment"] for seg in self.get_running_segments(worker_id)],
+                    "completed_segments": [seg["segment"] for seg in s["completed_segments"]],
+                }
+                for worker_id, s in self.state.items()
+            },
+        }
+
+class BaseStaticDistributor(BaseDistributor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.plan = {worker_id: deque(segments) for worker_id, segments in self.build_plan().items()}
+
+    def build_plan(self):
+        raise NotImplementedError
+
+    def orphan_choice(self, orphans):
+        return orphans[0]
+
     def pop_planned(self, worker_id):
         queue = self.plan[worker_id]
 
@@ -112,6 +186,8 @@ class BaseDistributor:
         return None
 
     def pick_orphan(self):
+        # orphan = segmen pending yang tidak ada di rencana worker mana pun
+        # (segmen gagal, atau milik worker yang hilang)
         planned = {s["segment"] for queue in self.plan.values() for s in queue}
         orphans = [s for s in self.pending_segments if s["segment"] not in planned]
 
@@ -153,80 +229,13 @@ class BaseDistributor:
         self.assign_to_worker(worker_id, segment)
         return segment
 
-    def complete_segment(self, worker_id, segment, encoding_time):
-        if encoding_time <= 0:
-            raise ValueError("Encoding time must be greater than zero.")
-
-        self.release_load(worker_id, segment)
-
-    def fail_segment(self, worker_id, segment, count_retry = True):
-        self.check_running(worker_id, segment)
-
-        worker_state = self.state[worker_id]
-        worker_state["assigned_segments"].remove(segment)
-        worker_state["remaining_frames"] -= segment["total_frames"]
-
-        if count_retry:
-            segment_id = segment["segment"]
-            self.retry_count[segment_id] = self.retry_count.get(segment_id, 0) + 1
-
-            if self.retry_count[segment_id] > self.max_retries:
-                self.failed_segments.append(segment)
-                return False
-
-        self.pending_segments.append(segment)
-        return True
-
     def disable_worker(self, worker_id):
-        self.state[worker_id]["active"] = False
-        returned_segments = []
-
-        for segment in self.get_running_segments(worker_id):
-            if self.fail_segment(worker_id, segment, count_retry = False):
-                returned_segments.append(segment)
-
+        returned_segments = super().disable_worker(worker_id)
+        # sisa rencana worker yang hilang dilepas sehingga menjadi orphan
         self.plan[worker_id].clear()
-
         return returned_segments
 
-    def get_idle_workers(self):
-        return [worker_id for worker_id in self.get_active_workers() if not self.get_running_segments(worker_id)]
-
-    def is_finished(self):
-        if self.pending_segments:
-            return False
-
-        return all(not self.get_running_segments(worker_id) for worker_id in self.state)
-
-    def get_status(self):
-        completed = sum(len(s["completed_segments"]) for s in self.state.values())
-        running = sum(len(self.get_running_segments(worker_id)) for worker_id in self.state)
-
-        return {
-            "total_segments": len(self.segments),
-            "completed": completed,
-            "running": running,
-            "pending": len(self.pending_segments),
-            "failed": len(self.failed_segments),
-            "finished": self.is_finished(),
-            "workers": {
-                worker_id: {
-                    "active": s["active"],
-                    "avg_fps": s["avg_fps"],
-                    "stddev_fps": s["stddev_fps"],
-                    "cv": self.get_coefficient(worker_id),
-                    "planning_fps": s["planning_fps"],
-                    "sample_count": s["sample_count"],
-                    "remaining_frames": s["remaining_frames"],
-                    "estimated_time": self.get_estimated_time(worker_id),
-                    "running_segments": [seg["segment"] for seg in self.get_running_segments(worker_id)],
-                    "completed_segments": [seg["segment"] for seg in s["completed_segments"]],
-                }
-                for worker_id, s in self.state.items()
-            },
-        }
-
-class FIFODistributor(BaseDistributor):
+class RRStaticDistributor(BaseStaticDistributor):
     def build_plan(self):
         worker_ids = list(self.state)
         plan = {worker_id: [] for worker_id in worker_ids}
@@ -236,26 +245,27 @@ class FIFODistributor(BaseDistributor):
 
         return plan
 
-class SJFDistributor(BaseDistributor):
+class SJFStaticDistributor(BaseStaticDistributor):
     def build_plan(self):
         worker_ids = list(self.state)
         plan = {worker_id: [] for worker_id in worker_ids}
+        ordered = sorted(self.segments, key = lambda s: (s["total_frames"], s["segment"]))
 
-        for index, segment in enumerate(sorted(self.segments, key = lambda s: s["total_frames"])):
+        for index, segment in enumerate(ordered):
             plan[worker_ids[index % len(worker_ids)]].append(segment)
 
         return plan
 
     def orphan_choice(self, orphans):
-        return min(orphans, key = lambda s: s["total_frames"])
+        return min(orphans, key = lambda s: (s["total_frames"], s["segment"]))
 
-class HeterogeneousDistributor(BaseDistributor):
+class HeteroStaticDistributor(BaseStaticDistributor):
     def build_plan(self):
         worker_ids = list(self.state)
         plan = {worker_id: [] for worker_id in worker_ids}
         load = {worker_id: 0.0 for worker_id in worker_ids}
 
-        for segment in sorted(self.segments, key = lambda s: s["total_frames"], reverse = True):
+        for segment in sorted(self.segments, key = lambda s: (-s["total_frames"], s["segment"])):
             best_worker = None
             best_finish_time = float("inf")
 
@@ -275,4 +285,75 @@ class HeterogeneousDistributor(BaseDistributor):
         return plan
 
     def orphan_choice(self, orphans):
-        return max(orphans, key = lambda s: s["total_frames"])
+        return max(orphans, key = lambda s: (s["total_frames"], -s["segment"]))
+
+class BaseDynamicDistributor(BaseDistributor):
+    def choose_segment(self, worker_id):
+        raise NotImplementedError
+
+    def worker_order(self):
+        return self.get_active_workers()
+
+    def initial_assignment(self, initial_size = 1):
+        if initial_size < 1:
+            raise ValueError("initial_size must be at least 1.")
+
+        result = {worker_id: [] for worker_id in self.state}
+
+        for _ in range(initial_size):
+            for worker_id in self.worker_order():
+                if not self.pending_segments:
+                    return result
+
+                segment = self.choose_segment(worker_id)
+                self.assign_to_worker(worker_id, segment)
+                result[worker_id].append(segment)
+
+        return result
+
+    def assign_next(self, worker_id):
+        if not self.state[worker_id]["active"] or not self.pending_segments:
+            return None
+
+        segment = self.choose_segment(worker_id)
+
+        if segment is None:
+            return None
+
+        self.assign_to_worker(worker_id, segment)
+        return segment
+
+class FIFODynamicDistributor(BaseDynamicDistributor):
+    def choose_segment(self, worker_id):
+        return min(self.pending_segments, key = lambda s: s["segment"])
+
+class SJFDynamicDistributor(BaseDynamicDistributor):
+    def choose_segment(self, worker_id):
+        return min(self.pending_segments, key = lambda s: (s["total_frames"], s["segment"]))
+
+class HeteroDynamicDistributor(BaseDynamicDistributor):
+    def worker_order(self):
+        return sorted(self.get_active_workers(), key = lambda worker_id: self.state[worker_id]["planning_fps"], reverse = True)
+
+    def get_finish_time(self, worker_id, segment):
+        worker_state = self.state[worker_id]
+        return (worker_state["remaining_frames"] + segment["total_frames"]) / worker_state["planning_fps"]
+
+    def select_worker(self, segment):
+        return min(
+            self.get_active_workers(),
+            key = lambda worker_id: (
+                self.get_finish_time(worker_id, segment),
+                self.get_coefficient(worker_id),
+                worker_id,
+            ),
+        )
+
+    def choose_segment(self, worker_id):
+        candidates = sorted(self.pending_segments, key = lambda s: (-s["total_frames"], s["segment"]))
+
+        for segment in candidates:
+            if self.select_worker(segment) == worker_id:
+                return segment
+
+        return candidates[-1]
