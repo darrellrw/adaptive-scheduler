@@ -185,6 +185,33 @@ def write_log_files(name, payload):
         logger.error("Gagal menulis log %s: %s", name, e)
         return {}
 
+def snapshot_worker_benchmarks(workers, distributor, codec, preset, crf):
+    snapshot = {}
+
+    for worker_id, worker in workers.items():
+        state = distributor.state.get(worker_id, {})
+        per_file = [
+            b for b in worker.list_benchmarks()
+            if b["codec"] == codec and b["preset"] == preset and str(b["crf"]) == str(crf)
+        ]
+
+        snapshot[worker_id] = {
+            "address": worker.address,
+            "port": worker.port,
+            "setting": {"codec": codec, "preset": preset, "crf": crf},
+            "merged": worker.get_benchmark(codec, preset, crf)["benchmark_summary"] if worker.has_benchmark(codec, preset, crf) else None,
+            "per_file": per_file,
+            "initial_planning": {
+                "avg_fps": state.get("avg_fps"),
+                "stddev_fps": state.get("stddev_fps"),
+                "planning_fps": state.get("planning_fps"),
+                "sample_count": state.get("sample_count"),
+            },
+            "all_benchmarks": worker.list_benchmarks(),
+        }
+
+    return snapshot
+
 class Job:
     def __init__(self, job_id, request, distributor, workers):
         self.job_id = job_id
@@ -206,6 +233,7 @@ class Job:
         self.cond = threading.Condition()
         self.load_video_time = 0.0
         self.merge = None
+        self.worker_benchmarks = snapshot_worker_benchmarks(workers, distributor, request.codec, request.preset, request.crf)
 
     def elapsed(self):
         return time.time() - self.created_at
@@ -345,6 +373,7 @@ def build_job_log(job):
         "events": job.events,
         "load_video_time": job.load_video_time,
         "workers": list(job.workers),
+        "worker_benchmarks": job.worker_benchmarks,
         "merge": job.merge,
     }
 

@@ -3,6 +3,7 @@
 .vscode
 __pycache__
 Scheduler/__pycache__
+Temp/
 
 # File
 .env
