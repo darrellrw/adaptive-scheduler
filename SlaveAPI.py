@@ -1,9 +1,12 @@
 import os
+import time
+import asyncio
 import threading
 
 import uvicorn
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from Scheduler import (
@@ -11,7 +14,7 @@ from Scheduler import (
     SegmentEncoding,
 )
 
-from Scheduler.Information import resolve_share_path
+from Scheduler.Information import resolve_share_path, kill_active_processes
 
 SLAVE_ID = os.environ.get("SLAVE_ID", "worker")
 SLAVE_HOST = os.environ.get("SLAVE_HOST", "0.0.0.0")
@@ -22,6 +25,42 @@ SHARE_DIR = os.environ.get("SHARE_DIR", ".")
 app = FastAPI(title = "Slave API")
 
 busy_lock = threading.Lock()
+
+worker_up = threading.Event()
+worker_up.set()
+fault_info = {"down": False, "crashed_at": None, "recovered_at": None, "killed_processes": 0}
+
+@app.middleware("http")
+async def fault_middleware(request: Request, call_next):
+    if request.url.path.startswith("/fault") or worker_up.is_set():
+        return await call_next(request)
+
+    while not worker_up.is_set():
+        await asyncio.sleep(0.2)
+
+    return JSONResponse(status_code = 503, content = {"detail": f"Worker {SLAVE_ID} was down (fault injection)."})
+
+@app.get("/fault")
+def fault_status():
+    return {"worker_id": SLAVE_ID, **fault_info}
+
+@app.post("/fault/crash")
+def fault_crash():
+    worker_up.clear()
+    fault_info.update(down = True, crashed_at = time.time(), recovered_at = None)
+    fault_info["killed_processes"] = kill_active_processes()
+    return {"worker_id": SLAVE_ID, **fault_info}
+
+@app.post("/fault/recover")
+def fault_recover():
+    fault_info.update(down = False, recovered_at = time.time())
+    worker_up.set()
+    return {"worker_id": SLAVE_ID, **fault_info}
+
+def wait_if_down():
+    if not worker_up.is_set():
+        worker_up.wait()
+        raise HTTPException(status_code = 503, detail = f"Worker {SLAVE_ID} was down (fault injection).")
 
 class BenchmarkRequest(BaseModel):
     video_path: str
@@ -100,10 +139,12 @@ def encode(request: EncodeRequest):
             crf = request.crf,
         )
     except RuntimeError as e:
+        wait_if_down()
         raise HTTPException(status_code = 500, detail = str(e))
     finally:
         busy_lock.release()
 
+    wait_if_down()
     result["worker_id"] = SLAVE_ID
     return result
 

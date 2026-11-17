@@ -2,6 +2,7 @@ import os
 import time
 import json
 import uuid
+import threading
 import subprocess
 import statistics
 
@@ -15,6 +16,21 @@ FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output/")
 SHARE_DIR = os.environ.get("SHARE_DIR", ".")
+
+ACTIVE_PROCESSES = set()
+ACTIVE_PROCESSES_LOCK = threading.Lock()
+
+def kill_active_processes():
+    with ACTIVE_PROCESSES_LOCK:
+        processes = list(ACTIVE_PROCESSES)
+
+    for process in processes:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    return len(processes)
 
 def resolve_share_path(relative_path, share_dir = SHARE_DIR):
     root = os.path.realpath(share_dir)
@@ -322,25 +338,31 @@ class SegmentEncoding:
         self.print_info = print_info
 
     def run_command(self, command, tool):
-        try:
-            result = subprocess.run(
-                command,
-                check = True,
-                capture_output = True,
-                text = True,
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"{tool} failed with error: {e.stderr.strip()}") from e
+        process = subprocess.Popen(
+            command,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            text = True,
+        )
 
-        return result.stdout.strip()
+        with ACTIVE_PROCESSES_LOCK:
+            ACTIVE_PROCESSES.add(process)
+
+        try:
+            stdout, stderr = process.communicate()
+        finally:
+            with ACTIVE_PROCESSES_LOCK:
+                ACTIVE_PROCESSES.discard(process)
+
+        if process.returncode != 0:
+            raise RuntimeError(f"{tool} failed with error: {stderr.strip()}")
+
+        return stdout.strip()
 
     def get_output_path(self, segment, extension = "mp4"):
         return os.path.join(self.output_dir, f"segment_{segment['segment']:04d}.{extension}")
 
     def build_command(self, segment, output_path, codec, preset, crf):
-        # segment dipotong langsung dari video asli (tanpa file potongan) dengan -ss di keyframe closed GOP.
-        # Seek dimundurkan setengah frame supaya frame keyframe tidak terbuang oleh pembulatan -ss,
-        # lalu jumlah frame dikunci dengan -frames:v supaya hasilnya tepat total_frames.
         frame_duration = segment["duration"] / segment["total_frames"]
         seek = max(0.0, segment["start"] - frame_duration / 2)
 
@@ -389,7 +411,6 @@ class SegmentEncoding:
                 if frames != segment["total_frames"]:
                     raise RuntimeError(f"Segment {segment['segment']} has {frames} frames, expected {segment['total_frames']}.")
 
-            # hasil baru dipublikasikan setelah lolos verifikasi, jadi file setengah jadi tidak pernah terlihat master
             os.replace(temp_path, output_path)
         finally:
             if os.path.exists(temp_path):

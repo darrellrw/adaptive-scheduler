@@ -21,6 +21,8 @@ from Scheduler import (
     WorkerRegistry,
     WorkerConflictError,
     AdaptiveDistributor,
+    AdaptiveNoWelfordDistributor,
+    AdaptiveNoSigmaDistributor,
     RRStaticDistributor,
     SJFStaticDistributor,
     HeteroStaticDistributor,
@@ -66,6 +68,9 @@ SCHEDULERS = {
     "fifo_dynamic": FIFODynamicDistributor,
     "sjf_dynamic": SJFDynamicDistributor,
     "hetero_dynamic": HeteroDynamicDistributor,
+    # varian ablation Adaptive
+    "adaptive_no_welford": AdaptiveNoWelfordDistributor,
+    "adaptive_no_sigma": AdaptiveNoSigmaDistributor,
 }
 
 def get_scheduler_class(name):
@@ -89,6 +94,11 @@ class BenchmarkRequest(BaseModel):
     repeat: int = Field(3, ge = 3)
     delay: float = Field(1, ge = 0)
 
+class FaultConfig(BaseModel):
+    worker: str = Field(min_length = 1)
+    at: float = Field(gt = 0)
+    recover_timeout: float = Field(60, gt = 0)
+
 class JobCreate(BaseModel):
     video_path: str
     scheduler: str = "adaptive"
@@ -97,6 +107,7 @@ class JobCreate(BaseModel):
     crf: int = 24
     initial_size: int = 1
     max_retries: int = 3
+    fault: Optional[FaultConfig] = None
 
 class EncoderConfig(BaseModel):
     label: Optional[str] = None
@@ -128,6 +139,8 @@ class ExperimentCreate(BaseModel):
     initial_size: int = Field(1, ge = 1)
     max_retries: int = Field(3, ge = 0)
     keep_output: bool = True
+
+    fault: Optional[FaultConfig] = None
 
     stop_on_error: bool = False
 
@@ -224,7 +237,19 @@ def write_log_files(name, payload):
             writer.writeheader()
             writer.writerows(payload["timeline"])
 
-        return {"json": json_path, "csv": csv_path}
+        paths = {"json": json_path, "csv": csv_path}
+
+        if payload.get("trajectory"):
+            trajectory_path = os.path.join(MASTER_LOG_DIR, f"{name}_trajectory.csv")
+
+            with open(trajectory_path, "w", newline = "", encoding = "utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames = TRAJECTORY_FIELDS, extrasaction = "ignore")
+                writer.writeheader()
+                writer.writerows(payload["trajectory"])
+
+            paths["trajectory_csv"] = trajectory_path
+
+        return paths
     except OSError as e:
         logger.error("Gagal menulis log %s: %s", name, e)
         return {}
@@ -256,6 +281,41 @@ def snapshot_worker_benchmarks(workers, distributor, codec, preset, crf):
 
     return snapshot
 
+TRAJECTORY_FIELDS = [
+    "time", "worker_id", "segment", "total_frames", "encoding_time", "measured_fps",
+    "sample_count", "avg_fps", "stddev_fps", "planning_fps",
+]
+
+def initial_trajectory_point(distributor, worker_id):
+    state = distributor.state[worker_id]
+    return {
+        "time": 0.0,
+        "worker_id": worker_id,
+        "segment": None,
+        "total_frames": None,
+        "encoding_time": None,
+        "measured_fps": None,
+        "sample_count": state["sample_count"],
+        "avg_fps": state["avg_fps"],
+        "stddev_fps": state["stddev_fps"],
+        "planning_fps": state["planning_fps"],
+    }
+
+def trajectory_point(job, worker_id, segment, encoding_time):
+    state = job.distributor.state[worker_id]
+    return {
+        "time": round(job.elapsed(), 3),
+        "worker_id": worker_id,
+        "segment": segment["segment"],
+        "total_frames": segment["total_frames"],
+        "encoding_time": round(encoding_time, 4),
+        "measured_fps": round(segment["total_frames"] / encoding_time, 4),
+        "sample_count": state["sample_count"],
+        "avg_fps": round(state["avg_fps"], 4),
+        "stddev_fps": round(state["stddev_fps"], 4),
+        "planning_fps": round(state["planning_fps"], 4),
+    }
+
 class Job:
     def __init__(self, job_id, request, distributor, workers):
         self.job_id = job_id
@@ -280,6 +340,9 @@ class Job:
         self.failures = []
         self.last_seen = {worker_id: 0.0 for worker_id in workers}
         self.stop_event = threading.Event()
+        self.fault = request.fault
+        self.fault_record = None
+        self.trajectory = [initial_trajectory_point(distributor, worker_id) for worker_id in distributor.state]
         self.worker_benchmarks = snapshot_worker_benchmarks(workers, distributor, request.codec, request.preset, request.crf)
 
     def elapsed(self):
@@ -473,6 +536,7 @@ def worker_loop(job, worker_id):
             job.last_seen[worker_id] = job.elapsed()
             job.end_record(record, "completed", result = result)
             distributor.complete_segment(worker_id, segment, result["encoding_time"])
+            job.trajectory.append(trajectory_point(job, worker_id, segment, result["encoding_time"]))
             job.results[segment["segment"]] = {
                 "segment": segment["segment"],
                 "worker_id": worker_id,
@@ -516,7 +580,96 @@ def build_job_log(job):
             "encode_timeout": ENCODE_TIMEOUT,
         },
         "failures": job.failures,
+        "fault_injection": job.fault_record,
+        "trajectory": job.trajectory,
     }
+
+def post_fault(worker, action):
+    response = requests.post(f"http://{worker.address}:{worker.port}/fault/{action}", timeout = HEALTH_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+def fault_injection_loop(job):
+    fault = job.fault
+    worker = job.workers[fault.worker]
+    record = job.fault_record
+
+    while True:
+        remaining = fault.at - job.elapsed()
+
+        if remaining <= 0:
+            break
+
+        if job.stop_event.wait(min(remaining, 0.5)):
+            record["status"] = "skipped"
+            record["error"] = "Job selesai sebelum waktu fault."
+            job.log(f"FAULT  dilewati: job selesai sebelum t={fault.at}s")
+            return
+
+    with job.cond:
+        if not job.distributor.state[fault.worker]["active"]:
+            record["status"] = "skipped"
+            record["error"] = "Worker sudah tidak aktif."
+            return
+
+        running = [s["segment"] for s in job.distributor.get_running_segments(fault.worker)]
+
+    injected_at = job.elapsed()
+
+    try:
+        response = post_fault(worker, "crash")
+        record.update(status = "injected", injected_at = round(injected_at, 3), running_segments = running, killed_processes = response.get("killed_processes"))
+        job.log(f"FAULT  {fault.worker} dimatikan pada t={injected_at:.2f}s (rencana {fault.at}s), segmen berjalan: {running}")
+    except (requests.RequestException, ValueError) as e:
+        record.update(status = "error", injected_at = round(injected_at, 3), error = str(e)[:300])
+        job.log(f"FAULT  gagal mematikan {fault.worker}: {e}")
+
+def recover_fault_worker(job):
+    record = job.fault_record
+
+    if not record or record.get("status") != "injected":
+        return
+
+    fault = job.fault
+    worker = job.workers[fault.worker]
+    deadline = time.time() + fault.recover_timeout
+
+    try:
+        post_fault(worker, "recover")
+    except (requests.RequestException, ValueError) as e:
+        record["recover_error"] = str(e)[:300]
+
+    while time.time() < deadline:
+        health = ping_worker(worker.address, worker.port)
+
+        if health.get("status") == "ok" and not health.get("busy"):
+            record["recovered"] = True
+            record["recover_time"] = round(fault.recover_timeout - (deadline - time.time()), 3)
+            job.log(f"FAULT  {fault.worker} pulih dalam {record['recover_time']:.2f}s")
+            return
+
+        time.sleep(0.5)
+
+    record["recovered"] = False
+    job.log(f"FAULT  {fault.worker} belum pulih setelah {fault.recover_timeout}s")
+
+def finalize_fault_record(job):
+    record = job.fault_record
+
+    if not record:
+        return
+
+    failure = next((f for f in job.failures if f["worker_id"] == job.fault.worker), None)
+
+    if failure and record.get("injected_at") is not None:
+        record.update(
+            detected_at = failure["detected_at"],
+            detected_by = failure["method"],
+            detection_latency = round(failure["detected_at"] - record["injected_at"], 3),
+            returned_segments = failure["returned_segments"],
+            lost_frames = failure["lost_frames"],
+            lost_work_time = failure["lost_work_time"],
+        )
 
 def run_job(job):
     worker_ids = job.distributor.get_active_workers()
@@ -536,13 +689,24 @@ def run_job(job):
         for worker_id in worker_ids
     ]
 
-    for thread in threads + heartbeats:
+    fault_thread = None
+
+    if job.fault:
+        job.fault_record = {"worker": job.fault.worker, "at": job.fault.at, "status": "pending"}
+        fault_thread = threading.Thread(target = fault_injection_loop, args = (job,), daemon = True)
+
+    for thread in threads + heartbeats + ([fault_thread] if fault_thread else []):
         thread.start()
 
     for thread in threads:
         thread.join()
 
     job.stop_event.set()
+
+    if fault_thread:
+        fault_thread.join()
+        finalize_fault_record(job)
+        recover_fault_worker(job)
 
     with job.cond:
         status = job.distributor.get_status()
@@ -611,6 +775,7 @@ def get_job_summary(job, event_count = 20):
             "events": job.events[-event_count:],
             "merge": job.merge,
             "failures": job.failures,
+            "fault_injection": job.fault_record,
         }
 
 def get_worker_or_404(worker_id):
@@ -869,6 +1034,12 @@ def start_job(request, internal = False):
     if not os.path.isfile(video_path):
         raise HTTPException(status_code = 404, detail = f"Video {request.video_path} not found in {SHARE_DIR}.")
 
+    if request.fault:
+        try:
+            registry.get_worker(request.fault.worker)
+        except ValueError:
+            raise HTTPException(status_code = 400, detail = f"Fault worker '{request.fault.worker}' is not registered.")
+
     with control_lock:
         if not internal and get_active_experiment():
             raise HTTPException(status_code = 409, detail = "An experiment is running, wait until it finishes or cancel it.")
@@ -945,6 +1116,7 @@ SCHEDULER_GROUPS = {
     "adaptive": ["adaptive"],
 }
 SCHEDULER_GROUPS["all"] = SCHEDULER_GROUPS["static"] + SCHEDULER_GROUPS["dynamic"] + SCHEDULER_GROUPS["adaptive"]
+SCHEDULER_GROUPS["ablation"] = ["hetero_dynamic", "adaptive_no_welford", "adaptive_no_sigma", "adaptive"]
 
 BENCHMARK_FIELDS = [
     "worker_id", "video_path", "label", "codec", "preset", "crf", "status",
@@ -955,7 +1127,10 @@ RUN_FIELDS = [
     "run", "repetition", "scheduler", "group", "label", "codec", "preset", "crf",
     "job_id", "status", "error", "makespan", "overall_fps", "load_video_time", "merge_time", "total_time",
     "attempts", "completed_segments", "failures", "output_size_bytes",
-    "worker_frames", "worker_utilization", "worker_idle_time", "log_json",
+    "worker_frames", "worker_utilization", "worker_idle_time",
+    "fault_worker", "fault_at", "fault_status", "fault_injected_at", "fault_detected_at",
+    "fault_detection_latency", "fault_returned_segments", "fault_lost_frames", "fault_recovered",
+    "log_json", "trajectory_csv",
 ]
 
 experiments = {}
@@ -970,7 +1145,7 @@ def get_active_experiment():
     return None
 
 def scheduler_group(name):
-    for group in ("static", "dynamic", "adaptive"):
+    for group in ("static", "dynamic", "adaptive", "ablation"):
         if name in SCHEDULER_GROUPS[group]:
             return group
 
@@ -1323,6 +1498,7 @@ def run_scheduler_phase(experiment):
                 crf = config["crf"],
                 initial_size = request.initial_size,
                 max_retries = request.max_retries,
+                fault = request.fault,
             ), internal = True)
         except HTTPException as e:
             row.update(status = "error", error = str(e.detail)[:300])
@@ -1363,7 +1539,22 @@ def run_scheduler_phase(experiment):
             worker_utilization = json.dumps({w: v["utilization"] for w, v in summary["workers"].items()}),
             worker_idle_time = json.dumps({w: v["idle_time"] for w, v in summary["workers"].items()}),
             log_json = job.log_files.get("json"),
+            trajectory_csv = job.log_files.get("trajectory_csv"),
         )
+
+        if job.fault_record:
+            fault = job.fault_record
+            row.update(
+                fault_worker = fault.get("worker"),
+                fault_at = fault.get("at"),
+                fault_status = fault.get("status"),
+                fault_injected_at = fault.get("injected_at"),
+                fault_detected_at = fault.get("detected_at"),
+                fault_detection_latency = fault.get("detection_latency"),
+                fault_returned_segments = json.dumps(fault.get("returned_segments")) if fault.get("returned_segments") is not None else None,
+                fault_lost_frames = fault.get("lost_frames"),
+                fault_recovered = fault.get("recovered"),
+            )
 
         if not request.keep_output:
             remove_job_output(job)
@@ -1438,6 +1629,7 @@ def create_experiment(request: ExperimentCreate, dry_run: bool = False):
         "schedulers": schedulers,
         "benchmarks_total": worker_count * len(request.benchmark_videos) * len(configs),
         "runs_total": len(plan),
+        "fault": request.fault.model_dump() if request.fault else None,
         "plan": [
             {"run": i, "repetition": p["repetition"], "scheduler": p["scheduler"], **p["config"]}
             for i, p in enumerate(plan, start = 1)
@@ -1458,6 +1650,9 @@ def create_experiment(request: ExperimentCreate, dry_run: bool = False):
 
         if not registry.list_workers():
             raise HTTPException(status_code = 400, detail = "No worker registered.")
+
+        if request.fault and request.fault.worker not in {w.id for w in registry.list_workers()}:
+            raise HTTPException(status_code = 400, detail = f"Fault worker '{request.fault.worker}' is not registered.")
 
         experiment = Experiment(uuid.uuid4().hex[:8], request, configs, schedulers, plan)
         experiment.registered = registered

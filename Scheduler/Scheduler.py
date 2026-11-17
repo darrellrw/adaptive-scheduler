@@ -1,6 +1,12 @@
 import math
 
 class AdaptiveDistributor:
+    USE_SIGMA = True
+    USE_WELFORD = True
+
+    def compute_planning_fps(self, mean, stddev):
+        return mean - stddev if self.USE_SIGMA else mean
+
     def __init__(self, workers, video_information, codec = "libx264", preset = "fast", crf = 24, max_retries = 3):
         self.workers = workers
         self.segments = video_information["segment_splits"]
@@ -20,7 +26,7 @@ class AdaptiveDistributor:
 
             avg_fps = worker.get_fps(codec, preset, crf)
             stddev_fps = worker.get_fps_stddev(codec, preset, crf)
-            planning_fps = avg_fps - stddev_fps
+            planning_fps = self.compute_planning_fps(avg_fps, stddev_fps)
 
             if planning_fps <= 0:
                 raise ValueError(f"Worker {worker.id} has non-positive planning FPS ({planning_fps}) for codec: {codec}, preset: {preset}, crf: {crf}")
@@ -174,14 +180,16 @@ class AdaptiveDistributor:
         worker_state["sample_count"] = n
         worker_state["avg_fps"] = mean
         worker_state["stddev_fps"] = math.sqrt(m2 / (n - 1))
-        worker_state["planning_fps"] = max(1e-6, mean - worker_state["stddev_fps"])
+        worker_state["planning_fps"] = max(1e-6, self.compute_planning_fps(mean, worker_state["stddev_fps"]))
 
     def complete_segment(self, worker_id, segment, encoding_time):
         if encoding_time <= 0:
             raise ValueError("Encoding time must be greater than zero.")
 
         self.release_load(worker_id, segment)
-        self.update_fps(worker_id, segment["total_frames"] / encoding_time)
+
+        if self.USE_WELFORD:
+            self.update_fps(worker_id, segment["total_frames"] / encoding_time)
 
     def fail_segment(self, worker_id, segment, count_retry = True):
         self.check_running(worker_id, segment)
@@ -247,3 +255,11 @@ class AdaptiveDistributor:
                 for worker_id, s in self.state.items()
             },
         }
+
+class AdaptiveNoWelfordDistributor(AdaptiveDistributor):
+    USE_SIGMA = True
+    USE_WELFORD = False
+
+class AdaptiveNoSigmaDistributor(AdaptiveDistributor):
+    USE_SIGMA = False
+    USE_WELFORD = True
