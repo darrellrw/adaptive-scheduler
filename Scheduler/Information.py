@@ -17,6 +17,9 @@ FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output/")
 SHARE_DIR = os.environ.get("SHARE_DIR", ".")
 
+FFMPEG_CORES = int(os.environ.get("FFMPEG_CORES", "0") or 0)
+TASKSET_PATH = os.environ.get("TASKSET_PATH", "taskset")
+
 ACTIVE_PROCESSES = set()
 ACTIVE_PROCESSES_LOCK = threading.Lock()
 
@@ -40,6 +43,31 @@ def resolve_share_path(relative_path, share_dir = SHARE_DIR):
         raise ValueError(f"Path {relative_path} is outside the shared directory.")
 
     return full_path
+
+def get_available_cores():
+    if hasattr(os, "sched_getaffinity"):
+        return sorted(os.sched_getaffinity(0))
+
+    return list(range(os.cpu_count() or 1))
+
+def get_ffmpeg_cores(count = FFMPEG_CORES):
+    if count <= 0:
+        return []
+
+    available = get_available_cores()
+
+    if count > len(available):
+        raise ValueError(f"FFMPEG_CORES={count} melebihi core yang tersedia {available}.")
+
+    return available[-count:]
+
+def with_cpu_limit(command):
+    cores = get_ffmpeg_cores()
+
+    if not cores:
+        return command
+
+    return [TASKSET_PATH, "-c", ",".join(str(c) for c in cores)] + command
 
 class VideoInformation:
     def __init__(self, input_path, output_dir = OUTPUT_DIR, ffmpeg_path = FFMPEG_PATH, ffprobe_path = FFPROBE_PATH, print_info = False):
@@ -243,7 +271,7 @@ class Benchmark:
     def run_command(self, command, tool):
         try:
             subprocess.run(
-                command,
+                with_cpu_limit(command),
                 check = True,
                 capture_output = True,
                 text = True,
@@ -339,7 +367,7 @@ class SegmentEncoding:
 
     def run_command(self, command, tool):
         process = subprocess.Popen(
-            command,
+            with_cpu_limit(command),
             stdout = subprocess.PIPE,
             stderr = subprocess.PIPE,
             text = True,

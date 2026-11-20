@@ -14,13 +14,15 @@ from Scheduler import (
     SegmentEncoding,
 )
 
-from Scheduler.Information import resolve_share_path, kill_active_processes
+from Scheduler.Information import resolve_share_path, kill_active_processes, get_ffmpeg_cores, get_available_cores
 
 SLAVE_ID = os.environ.get("SLAVE_ID", "worker")
 SLAVE_HOST = os.environ.get("SLAVE_HOST", "0.0.0.0")
 SLAVE_PORT = int(os.environ.get("SLAVE_PORT", "5000"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output/")
 SHARE_DIR = os.environ.get("SHARE_DIR", ".")
+FFMPEG_CPU_LIST = get_ffmpeg_cores()
+print(f"[{SLAVE_ID}] core tersedia {get_available_cores()}, FFmpeg dibatasi ke {FFMPEG_CPU_LIST or 'semua core'}")
 
 app = FastAPI(title = "Slave API")
 
@@ -103,7 +105,7 @@ def acquire_worker():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "worker_id": SLAVE_ID, "busy": busy_lock.locked()}
+    return {"status": "ok", "worker_id": SLAVE_ID, "busy": busy_lock.locked(), "ffmpeg_cpus": FFMPEG_CPU_LIST}
 
 @app.post("/benchmark")
 def benchmark(request: BenchmarkRequest):
