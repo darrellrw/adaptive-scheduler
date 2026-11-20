@@ -115,6 +115,12 @@ class EncoderConfig(BaseModel):
     preset: Union[str, int, List[Union[str, int]]] = "fast"
     crf: Union[int, List[int]] = 24
 
+class ScenarioConfig(BaseModel):
+    name: str = Field(min_length = 1, max_length = 32, pattern = r"^[A-Za-z0-9_-]+$")
+    fault: Optional[FaultConfig] = None
+    repetitions: Optional[int] = Field(None, ge = 1)
+    keep_output: Optional[bool] = None
+
 class ExperimentCreate(BaseModel):
     name: str = Field("experiment", min_length = 1, max_length = 64, pattern = r"^[A-Za-z0-9_-]+$")
 
@@ -141,6 +147,11 @@ class ExperimentCreate(BaseModel):
     keep_output: bool = True
 
     fault: Optional[FaultConfig] = None
+
+    scenarios: List[ScenarioConfig] = []
+
+    check_before_run: bool = True
+    health_wait: float = Field(120, ge = 0)
 
     stop_on_error: bool = False
 
@@ -1124,9 +1135,9 @@ BENCHMARK_FIELDS = [
 ]
 
 RUN_FIELDS = [
-    "run", "repetition", "scheduler", "group", "label", "codec", "preset", "crf",
+    "run", "scenario", "valid", "repetition", "scheduler", "group", "label", "codec", "preset", "crf",
     "job_id", "status", "error", "makespan", "overall_fps", "load_video_time", "merge_time", "total_time",
-    "attempts", "completed_segments", "failures", "output_size_bytes",
+    "attempts", "completed_segments", "failures", "failed_workers", "output_size_bytes",
     "worker_frames", "worker_utilization", "worker_idle_time",
     "fault_worker", "fault_at", "fault_status", "fault_injected_at", "fault_detected_at",
     "fault_detection_latency", "fault_returned_segments", "fault_lost_frames", "fault_recovered",
@@ -1191,29 +1202,75 @@ def expand_encoders(encoders):
 
     return configs
 
-def build_run_plan(request, configs, schedulers):
-    rng = random.Random(request.seed)
+def get_scenarios(request):
+    """Skenario efektif. Tanpa field scenarios, eksperimen lama tetap berjalan sebagai satu skenario."""
+    if request.scenarios:
+        return list(request.scenarios)
+
+    return [ScenarioConfig(name = "fault" if request.fault else "normal", fault = request.fault)]
+
+def build_run_plan(request, configs, schedulers, scenarios):
     plan = []
 
-    for repetition in range(1, request.repetitions + 1):
-        for config in configs:
-            order = list(schedulers)
+    for scenario in scenarios:
+        # seed sama untuk setiap skenario -> urutan scheduler normal & fault identik (berpasangan)
+        rng = random.Random(request.seed)
+        repetitions = scenario.repetitions or request.repetitions
+        keep_output = request.keep_output if scenario.keep_output is None else scenario.keep_output
 
-            if request.shuffle:
-                rng.shuffle(order)
+        for repetition in range(1, repetitions + 1):
+            for config in configs:
+                order = list(schedulers)
 
-            for scheduler in order:
-                plan.append({"repetition": repetition, "config": config, "scheduler": scheduler})
+                if request.shuffle:
+                    rng.shuffle(order)
+
+                for scheduler in order:
+                    plan.append({
+                        "scenario": scenario.name,
+                        "fault": scenario.fault,
+                        "keep_output": keep_output,
+                        "repetition": repetition,
+                        "config": config,
+                        "scheduler": scheduler,
+                    })
 
     return plan
 
+def is_valid_run(row, fault):
+    if row.get("status") != "completed":
+        return False
+
+    if fault is None:
+        return row.get("failures") == 0
+
+    return row.get("fault_status") == "injected" and row.get("failures") == 1 and row.get("failed_workers") == [fault.worker]
+
+def wait_workers_healthy(experiment, timeout):
+    deadline = time.time() + timeout
+
+    while True:
+        unhealthy = []
+
+        for worker in registry.list_workers():
+            health = ping_worker(worker.address, worker.port)
+
+            if health.get("status") != "ok" or health.get("busy"):
+                unhealthy.append(f"{worker.id} ({health.get('status')}{', busy' if health.get('busy') else ''})")
+
+        if not unhealthy or time.time() >= deadline or experiment.cancel_event.is_set():
+            return unhealthy
+
+        experiment.cancel_event.wait(5)
+
 class Experiment:
-    def __init__(self, experiment_id, request, configs, schedulers, plan):
+    def __init__(self, experiment_id, request, configs, schedulers, plan, scenarios = None):
         self.experiment_id = experiment_id
         self.request = request
         self.configs = configs
         self.schedulers = schedulers
         self.plan = plan
+        self.scenarios = scenarios or get_scenarios(request)
         self.status = "pending"
         self.phase = "pending"
         self.error = None
@@ -1257,6 +1314,16 @@ class Experiment:
                     "benchmarks_total": self.benchmark_total(),
                     "runs_done": len(self.runs),
                     "runs_total": len(self.plan),
+                    "runs_valid": sum(1 for r in self.runs if r.get("valid")),
+                    "scenarios": {
+                        s.name: {
+                            "fault": s.fault.model_dump() if s.fault else None,
+                            "runs_done": sum(1 for r in self.runs if r.get("scenario") == s.name),
+                            "runs_valid": sum(1 for r in self.runs if r.get("scenario") == s.name and r.get("valid")),
+                            "runs_total": sum(1 for p in self.plan if p["scenario"] == s.name),
+                        }
+                        for s in self.scenarios
+                    },
                 },
                 "configs": self.configs,
                 "schedulers": self.schedulers,
@@ -1282,7 +1349,10 @@ def write_experiment_log(experiment):
         with experiment.lock:
             payload = experiment.snapshot(event_count = 300)
             payload["request"] = experiment.request.model_dump()
-            payload["plan"] = experiment.plan
+            payload["plan"] = [
+                {**p, "fault": p["fault"].model_dump() if p.get("fault") else None}
+                for p in experiment.plan
+            ]
             payload["fault_detection"] = {
                 "heartbeat_interval": HEARTBEAT_INTERVAL,
                 "heartbeat_misses": HEARTBEAT_MISSES,
@@ -1310,7 +1380,6 @@ def write_experiment_log(experiment):
         logger.error("Gagal menulis log eksperimen %s: %s", experiment.experiment_id, e)
 
 def register_experiment_workers(request):
-    """Validasi lalu daftarkan worker. Worker dengan ID sama dan alamat sama dilewati."""
     new_items = []
     existing = []
     conflicts = []
@@ -1472,9 +1541,20 @@ def run_scheduler_phase(experiment):
             if experiment.cancel_event.wait(request.job_cooldown):
                 break
 
+        if request.check_before_run:
+            unhealthy = wait_workers_healthy(experiment, request.health_wait)
+
+            if unhealthy:
+                experiment.error = f"Worker tidak sehat sebelum run {index}: {', '.join(unhealthy)}"
+                experiment.log(f"STOP   {experiment.error}")
+                break
+
         config = item["config"]
+        fault = item["fault"]
         row = {
             "run": index,
+            "scenario": item["scenario"],
+            "valid": False,
             "repetition": item["repetition"],
             "scheduler": item["scheduler"],
             "group": scheduler_group(item["scheduler"]),
@@ -1487,7 +1567,7 @@ def run_scheduler_phase(experiment):
         with experiment.lock:
             experiment.current = {"phase": "scheduling", **row}
 
-        experiment.log(f"RUN    {index}/{len(experiment.plan)} rep {item['repetition']} | {item['scheduler']} | {config['label']} preset {config['preset']} crf {config['crf']}")
+        experiment.log(f"RUN    {index}/{len(experiment.plan)} [{item['scenario']}] rep {item['repetition']} | {item['scheduler']} | {config['label']} preset {config['preset']} crf {config['crf']}")
 
         try:
             job, thread = start_job(JobCreate(
@@ -1498,7 +1578,7 @@ def run_scheduler_phase(experiment):
                 crf = config["crf"],
                 initial_size = request.initial_size,
                 max_retries = request.max_retries,
-                fault = request.fault,
+                fault = fault,
             ), internal = True)
         except HTTPException as e:
             row.update(status = "error", error = str(e.detail)[:300])
@@ -1534,6 +1614,7 @@ def run_scheduler_phase(experiment):
             attempts = summary["attempts"],
             completed_segments = summary["completed_segments"],
             failures = len(job.failures),
+            failed_workers = [f["worker_id"] for f in job.failures],
             output_size_bytes = output_size,
             worker_frames = json.dumps({w: v["frames"] for w, v in summary["workers"].items()}),
             worker_utilization = json.dumps({w: v["utilization"] for w, v in summary["workers"].items()}),
@@ -1543,23 +1624,28 @@ def run_scheduler_phase(experiment):
         )
 
         if job.fault_record:
-            fault = job.fault_record
+            record = job.fault_record
             row.update(
-                fault_worker = fault.get("worker"),
-                fault_at = fault.get("at"),
-                fault_status = fault.get("status"),
-                fault_injected_at = fault.get("injected_at"),
-                fault_detected_at = fault.get("detected_at"),
-                fault_detection_latency = fault.get("detection_latency"),
-                fault_returned_segments = json.dumps(fault.get("returned_segments")) if fault.get("returned_segments") is not None else None,
-                fault_lost_frames = fault.get("lost_frames"),
-                fault_recovered = fault.get("recovered"),
+                fault_worker = record.get("worker"),
+                fault_at = record.get("at"),
+                fault_status = record.get("status"),
+                fault_injected_at = record.get("injected_at"),
+                fault_detected_at = record.get("detected_at"),
+                fault_detection_latency = record.get("detection_latency"),
+                fault_returned_segments = json.dumps(record.get("returned_segments")) if record.get("returned_segments") is not None else None,
+                fault_lost_frames = record.get("lost_frames"),
+                fault_recovered = record.get("recovered"),
             )
 
-        if not request.keep_output:
+        row["valid"] = is_valid_run(row, fault)
+
+        if not item["keep_output"]:
             remove_job_output(job)
 
-        experiment.log(f"RUN    selesai {job.job_id}: {job.status}, makespan {summary['makespan']:.2f}s, {summary['overall_fps']:.2f} fps")
+        experiment.log(
+            f"RUN    selesai {job.job_id}: {job.status}, makespan {summary['makespan']:.2f}s, "
+            f"{summary['overall_fps']:.2f} fps, {'valid' if row['valid'] else 'TIDAK VALID'}"
+        )
 
         with experiment.lock:
             experiment.runs.append(row)
@@ -1611,12 +1697,21 @@ def create_experiment(request: ExperimentCreate, dry_run: bool = False):
 
     configs = expand_encoders(request.encoders)
 
+    if request.scenarios and request.fault:
+        raise HTTPException(status_code = 400, detail = "Use either 'fault' or 'scenarios', not both. Put the fault inside a scenario.")
+
+    scenarios = get_scenarios(request)
+    names = [s.name for s in scenarios]
+
+    if len(names) != len(set(names)):
+        raise HTTPException(status_code = 400, detail = f"Scenario names must be unique: {names}")
+
     for video_path in request.benchmark_videos:
         check_video_path(video_path)
 
     if request.video_path:
         check_video_path(request.video_path)
-        plan = build_run_plan(request, configs, schedulers)
+        plan = build_run_plan(request, configs, schedulers, scenarios)
     else:
         plan = []
 
@@ -1629,9 +1724,18 @@ def create_experiment(request: ExperimentCreate, dry_run: bool = False):
         "schedulers": schedulers,
         "benchmarks_total": worker_count * len(request.benchmark_videos) * len(configs),
         "runs_total": len(plan),
-        "fault": request.fault.model_dump() if request.fault else None,
+        "scenarios": [
+            {
+                "name": s.name,
+                "fault": s.fault.model_dump() if s.fault else None,
+                "repetitions": s.repetitions or request.repetitions,
+                "keep_output": request.keep_output if s.keep_output is None else s.keep_output,
+                "runs": sum(1 for p in plan if p["scenario"] == s.name),
+            }
+            for s in scenarios
+        ],
         "plan": [
-            {"run": i, "repetition": p["repetition"], "scheduler": p["scheduler"], **p["config"]}
+            {"run": i, "scenario": p["scenario"], "repetition": p["repetition"], "scheduler": p["scheduler"], **p["config"]}
             for i, p in enumerate(plan, start = 1)
         ],
     }
@@ -1651,10 +1755,13 @@ def create_experiment(request: ExperimentCreate, dry_run: bool = False):
         if not registry.list_workers():
             raise HTTPException(status_code = 400, detail = "No worker registered.")
 
-        if request.fault and request.fault.worker not in {w.id for w in registry.list_workers()}:
-            raise HTTPException(status_code = 400, detail = f"Fault worker '{request.fault.worker}' is not registered.")
+        registered_ids = {w.id for w in registry.list_workers()}
 
-        experiment = Experiment(uuid.uuid4().hex[:8], request, configs, schedulers, plan)
+        for s in scenarios:
+            if s.fault and s.fault.worker not in registered_ids:
+                raise HTTPException(status_code = 400, detail = f"Fault worker '{s.fault.worker}' in scenario '{s.name}' is not registered.")
+
+        experiment = Experiment(uuid.uuid4().hex[:8], request, configs, schedulers, plan, scenarios)
         experiment.registered = registered
 
         with experiments_lock:
@@ -1662,7 +1769,8 @@ def create_experiment(request: ExperimentCreate, dry_run: bool = False):
 
     experiment.log(
         f"eksperimen dibuat: {len(registry.list_workers())} worker, {len(configs)} konfigurasi, "
-        f"{len(schedulers)} scheduler, {experiment.benchmark_total()} benchmark, {len(plan)} run"
+        f"{len(schedulers)} scheduler, {experiment.benchmark_total()} benchmark, {len(plan)} run "
+        f"dalam skenario {[s.name for s in scenarios]}"
     )
     threading.Thread(target = run_experiment, args = (experiment,), daemon = True).start()
 
